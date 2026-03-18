@@ -116,7 +116,7 @@ def create_dataloader(config: DataConfig,
         drop_last=True,
     )
 
-    if 'val' in config.dataset_kwargs:
+    if config.dataset_kwargs and 'val' in config.dataset_kwargs:
         dataset_kwargs.update(config.dataset_kwargs['val'])
 
     val_dataset = dataset_cls(
