@@ -1,0 +1,5 @@
+tools:
+  - class_name: "rllava.ppo.tool.visual_crop_tool.VisualCropTool"
+    config:
+      min_crop_side: 28
+      enable_rotate: false

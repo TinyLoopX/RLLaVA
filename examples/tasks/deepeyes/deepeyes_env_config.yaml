@@ -1,0 +1,6 @@
+env:
+  class_name: "./examples/tasks/deepeyes/deepeyes_env.py:DeepEyesEnv"
+  config:
+    min_crop_side: 28
+    enable_rotate: false
+    concurrent_workers: 8

@@ -1,0 +1,7 @@
+env:
+  class_name: "./examples/tasks/agent_code/agent_code_env.py:AgentCodeEnv"
+  config:
+    max_code_seconds: 10
+    bbox_norm: 1000
+    concurrent_workers: 4
+    # cache_dir: /tmp/agent_code_env  # uncomment to override scratch dir

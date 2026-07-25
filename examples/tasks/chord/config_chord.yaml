@@ -1,0 +1,114 @@
+data:
+  train_files: ${oc.env:OBS_CHORD_TRAIN,hiyouga/math12k@train}
+  val_files: ${oc.env:OBS_CHORD_VAL,hiyouga/math12k@test}
+  prompt_key: problem
+  answer_key: answer
+  image_key: images
+  video_key: videos
+  image_dir: null
+  video_fps: 2.0
+  max_prompt_length: 512
+  max_response_length: 512
+  train_batch_size: 320
+  val_batch_size: 512
+  format_prompt: ./examples/format_prompt/math.jinja
+  override_chat_template: null
+  shuffle: true
+  seed: 1
+  min_pixels: 262144
+  max_pixels: 4194304
+  filter_overlong_prompts: true
+
+algorithm:
+  # Use GRPO advantage; CHORD routes SFT via expert_mask in sampler
+  adv_estimator: grpo
+  strategy: mix_chord
+  expert_data_ratio: 0.20
+  mu_warmup_steps: 200
+  mu_decay_steps: 400
+  mu_peak: 0.5
+  mu_valley: 0.02
+  enable_phi_function: true
+  clip_range: 0.2
+  use_token_level_loss_in_sft: true
+
+actor:
+  ppo_mini_batch_size: 320
+  ppo_micro_batch_size: 4
+  log_prob_micro_batch_size: 4
+  max_grad_norm: 1.0
+  ulysses_size: 2
+  model:
+    model_path: ${oc.env:OBS_CHORD_MODEL,Qwen/Qwen2.5-1.5B-Instruct}
+    enable_gradient_checkpointing: true
+    trust_remote_code: false
+    freeze_vision_tower: false
+  optim:
+    lr: 1.0e-6
+    weight_decay: 1.0e-2
+    strategy: adamw
+    lr_warmup_ratio: 0.0
+  fsdp:
+    enable_cpu_offload: true
+    use_orig_params: true
+    offload_params: true
+    offload_optimizer: true
+
+rollout:
+  n: 5
+  temperature: 1.0
+  top_p: 1.0
+  limit_images: 0
+  tensor_parallel_size: 1
+  disable_tqdm: false
+  vllm:
+    gpu_memory_utilization: 0.4
+    enforce_eager: true
+    enable_chunked_prefill: false
+  val_override_config:
+    temperature: 0.0
+    top_p: 1.0
+    top_k: -1
+    n: 1
+
+critic: null
+
+ref:
+  fsdp:
+    enable_cpu_offload: true
+  offload:
+    offload_params: false
+
+reward:
+  reward_type: batch
+  reward_function: ./examples/reward_function/math.py:compute_score
+
+trainer:
+  total_epochs: 4
+  project_name: chord
+  experiment_name: chord_mix_qwen2_5_1p5b
+  logger: ["console", "tensorboard"]
+  nnodes: 1
+  n_gpus_per_node: 4
+  max_try_make_batch: 20
+  val_freq: -1
+  val_before_train: false
+  save_freq: 50
+  save_limit: 3
+  save_model_only: false
+  save_checkpoint_path: ${oc.env:OBS_CHORD_OUT,./checkpoints/chord}
+  load_checkpoint_path: null
+  find_last_checkpoint: true
+
+mix_sampler:
+  # Auxiliary SFT dataset used as expert buffer
+  sft_dataset:
+    total_epochs: 25
+    name: SFT_data
+    storage_type: file
+    path: ${oc.env:OBS_CHORD_SFT,open-r1/Mixture-of-Thoughts}
+    split: train
+    format:
+      prompt_type: messages
+      messages_key: messages
+

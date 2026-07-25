@@ -26,7 +26,7 @@ class VLLMConfig:
     seed: Optional[int] = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
-    dtype: str = "bfloat16"
+    dtype: str = "float16"
     pipeline_parallel_size: int = 1
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.9

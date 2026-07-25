@@ -1,0 +1,5 @@
+tools:
+  - class_name: "rllava.ppo.tool.code_execute_tool.CodeExecuteTool"
+    config:
+      bbox_norm: 1000
+      # cache_dir: /tmp/code_execute_tool   # uncomment to override scratch dir

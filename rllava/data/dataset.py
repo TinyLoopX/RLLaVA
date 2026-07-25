@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from jinja2 import Template
 from typing import Dict,  Sequence
 from PIL import Image, ImageFile
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, concatenate_datasets
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from .text_preprocess import TextPreprocess
@@ -71,27 +71,7 @@ class RLHFDataset(Dataset):
         else:
             data_split = "train"
 
-        if os.path.isdir(data_path):
-            # Local directory containing dataset (e.g., HF cache format)
-            try:
-                # Try to load as a DatasetDict with splits
-                full_dataset = load_from_disk(data_path)
-                if hasattr(full_dataset, 'keys') and data_split in full_dataset:
-                    self.dataset = full_dataset[data_split]
-                else:
-                    # It's a single dataset, use it directly
-                    self.dataset = full_dataset
-            except:
-                # Fallback: try loading as Arrow dataset
-                self.dataset = load_dataset("arrow", data_dir=data_path, split=data_split)
-        elif os.path.isfile(data_path):
-            # Single file
-            file_type = os.path.splitext(data_path)[-1][1:].replace("jsonl", "json")
-            self.dataset = load_dataset(file_type, data_files=data_path, split=data_split)
-        else:
-            # Remote dataset from huggingface hub
-            self.dataset = load_dataset(data_path, split=data_split)
-
+        self.dataset = self._load_data(data_path, data_split)
         self.data_source = {"path": data_path, "split": data_split}
 
         self.format_prompt = None
@@ -105,8 +85,40 @@ class RLHFDataset(Dataset):
                 doc2len, filter_overlong_prompts_workers
             )
 
+    @staticmethod
+    def _load_single(path: str, split: str):
+        """Load a single data source (file, directory, or HF hub name)."""
+        if os.path.isdir(path):
+            try:
+                full_dataset = load_from_disk(path)
+                if hasattr(full_dataset, "keys") and split in full_dataset:
+                    return full_dataset[split]
+                return full_dataset
+            except Exception:
+                return load_dataset("arrow", data_dir=path, split=split)
+        elif os.path.isfile(path):
+            file_type = os.path.splitext(path)[-1][1:].replace("jsonl", "json")
+            return load_dataset(file_type, data_files=path, split=split)
+        else:
+            return load_dataset(path, split=split)
+
+    def _load_data(self, data_path: str, data_split: str):
+        """Load one or more data sources separated by commas."""
+        paths = [p.strip() for p in data_path.split(",") if p.strip()]
+        if len(paths) == 1:
+            return self._load_single(paths[0], data_split)
+        datasets = [self._load_single(p, data_split) for p in paths]
+        combined = concatenate_datasets(datasets)
+        print(f"Concatenated {len(paths)} datasets: {[len(d) for d in datasets]} → {len(combined)} total")
+        return combined
+
     def _build_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
-        prompt_str: str = example[self.prompt_key]
+        prompt = example[self.prompt_key]
+
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+            return prompt
+
+        prompt_str: str = prompt
         if self.format_prompt:
             format_prompt = Template(self.format_prompt.strip())
             prompt_str = format_prompt.render(content=prompt_str)
@@ -340,6 +352,7 @@ class RLHFDataset(Dataset):
             model_inputs = self.tokenizer([prompt], add_special_tokens=False, return_tensors="pt")
             input_ids = model_inputs.pop("input_ids")[0]
             attention_mask = model_inputs.pop("attention_mask")[0]
+            example["initial_prompt_text"] = messages[0]["content"]# for environment reset
 
         if self.processor is not None and "Qwen2VLImageProcessor" in self.processor.image_processor.__class__.__name__:
             # qwen-vl mrope
@@ -384,7 +397,10 @@ class RLHFDataset(Dataset):
         example["attention_mask"] = attention_mask
         example["position_ids"] = position_ids
         example["raw_prompt_ids"] = raw_prompt_ids
-        example["ground_truth"] = example.pop(self.answer_key)
+        if self.answer_key and self.answer_key in example:
+            example["ground_truth"] = example.pop(self.answer_key)
+        else:
+            example["ground_truth"] = ""
         example["item"] = index
         return example
 

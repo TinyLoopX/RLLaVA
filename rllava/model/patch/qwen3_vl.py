@@ -28,6 +28,104 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def patch_qwen3_vl_vision_fast_pos_embed_interpolate():
+    """Patch Qwen3-VL vision pos interpolation for FSDP CPU offload.
+
+    Under FSDP parameter offload, ``self.pos_embed.weight.device`` can report
+    ``cpu`` even though the actual embedding lookup is materialized on GPU
+    during forward. The upstream implementation uses the parameter device to
+    create index tensors, which can cause the embedding lookup to mix CPU index
+    tensors with CUDA weights. Use the runtime ``grid_thw.device`` instead.
+    """
+    from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel
+
+    if getattr(Qwen3VLVisionModel, "_rllava_fast_pos_embed_patched", False):
+        return
+
+    original_fast_pos_embed_interpolate = Qwen3VLVisionModel.fast_pos_embed_interpolate
+
+    @functools.wraps(original_fast_pos_embed_interpolate)
+    def patched_fast_pos_embed_interpolate(self, grid_thw):
+        runtime_device = grid_thw.device
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+
+        idx_list = [[] for _ in range(4)]
+        weight_list = [[] for _ in range(4)]
+
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h_int = int(h.item())
+            w_int = int(w.item())
+
+            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h_int, device=runtime_device)
+            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w_int, device=runtime_device)
+
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs_floor + 1).clip(max=self.num_grid_per_side - 1)
+
+            dh = h_idxs - h_idxs_floor
+            dw = w_idxs - w_idxs_floor
+
+            base_h = h_idxs_floor * self.num_grid_per_side
+            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
+
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
+
+            for i in range(4):
+                idx_list[i].extend(indices[i].tolist())
+                weight_list[i].extend(weights[i].tolist())
+
+        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=runtime_device)
+        weight_tensor = torch.tensor(
+            weight_list, dtype=self.pos_embed.weight.dtype, device=runtime_device
+        )
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
+        split_sizes = [int((h * w).item()) for h, w in zip(grid_hs, grid_ws)]
+        patch_pos_embeds = patch_pos_embeds.split(split_sizes)
+
+        patch_pos_embeds_permute = []
+        merge_size = self.config.spatial_merge_size
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            t_int = int(t.item())
+            h_int = int(h.item())
+            w_int = int(w.item())
+            pos_embed = pos_embed.repeat(t_int, 1)
+            pos_embed = (
+                pos_embed.view(
+                    t_int,
+                    h_int // merge_size,
+                    merge_size,
+                    w_int // merge_size,
+                    merge_size,
+                    -1,
+                )
+                .permute(0, 1, 3, 2, 4, 5)
+                .flatten(0, 4)
+            )
+            patch_pos_embeds_permute.append(pos_embed)
+        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
+        return patch_pos_embeds
+
+    Qwen3VLVisionModel.fast_pos_embed_interpolate = patched_fast_pos_embed_interpolate
+    Qwen3VLVisionModel._rllava_fast_pos_embed_patched = True
+    logger.info("Monkey patched Qwen3VLVisionModel.fast_pos_embed_interpolate for runtime device")
+
+
 def get_rope_index(
     processor,
     input_ids: torch.Tensor,

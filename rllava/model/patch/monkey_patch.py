@@ -358,10 +358,12 @@ def apply_monkey_patch(
 
         from rllava.model.patch.qwen3_vl import (
             forward_with_normal_backend,
+            patch_qwen3_vl_vision_fast_pos_embed_interpolate,
             patch_qwen3_vl_moe_sparse_moe_block_forward,
             qwen3_vl_base_forward,
         )
 
+        patch_qwen3_vl_vision_fast_pos_embed_interpolate()
         Qwen3VLModel.forward = qwen3_vl_base_forward
         Qwen3VLMoeModel.forward = qwen3_vl_base_forward
         Qwen3VLForConditionalGeneration.forward = forward_with_normal_backend

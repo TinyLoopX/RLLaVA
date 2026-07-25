@@ -222,6 +222,7 @@ class VLLMEngine(InferenceEngine):
         response_mask = VF.get_response_mask(
             response_ids=response_ids, eos_token_id=eos_token_id, dtype=attention_mask.dtype
         )
+        response_length = torch.sum(response_mask, dim=-1)
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
         batch = TensorDict(

@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+from tensordict import TensorDict
 from ..config import RolloutConfig
 from rllava.engine import EngineFactory
 from rllava.data.protocol import DataProto
@@ -29,7 +30,14 @@ class Rollout():
         self.processor = processor
         self.reward = reward
         if workflow is not None:
-            self.workflow = workflow(self.reward, self.tokenizer, self.processor, self.config.max_turns, self.config.discount, self.config.tool_config_path, self.config.env_config_path)
+            self.workflow = workflow(
+                self.reward,
+                self.tokenizer,
+                self.processor,
+                self.config.max_turns,
+                self.config.discount,
+                self.config.env_config_path,
+            )
         else:
             self.workflow = None
         if rollout_processor is not None:
@@ -114,23 +122,31 @@ class Rollout():
         if self.rollout_processor is not None and val is False:
             gen_batch = self.rollout_processor.pre_process(gen_batch)
 
-        if self.workflow is None:
-        # DP handled by Accelerate's sharded dataloaders; generate normally on each rank's batch
-            gen_batch_output = self.generate_sequences(gen_batch)
+        if self.workflow is not None:
+            # Pre-expand both gen_batch and data by n so every trajectory is independent.
+            # Inside the workflow each turn runs with n=1 (enforced via meta_info).
+            rollout_n = self.config.val_override_config.get("n", 1) if val else self.config.n
+            if rollout_n > 1:
+                gen_batch = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+                data = data.repeat(repeat_times=rollout_n, interleave=True)
+            gen_batch_output = self.workflow.run(self, gen_batch, data)
         else:
-            # MultiTurnWorkflow: process each sample individually
-            results = []
-            for i in range(len(gen_batch.batch['input_ids'])):
-                single_data = gen_batch[[i]]
-                result = self.workflow.arun_single(self, single_data)
-                results.append(result)
-            gen_batch_output = DataProto.concat(results)
+            # DP handled by Accelerate's sharded dataloaders; generate normally on each rank's batch
+            gen_batch_output = self.generate_sequences(gen_batch)
 
         if self.rollout_processor is not None and val is False:
             gen_batch_output = self.rollout_processor.post_process(gen_batch_output, gen_batch)
 
         if val:
-            data = data.repeat(repeat_times=self.config.val_override_config.get("n", 1), interleave=True)
+            # data already expanded for workflow path; repeat only for non-workflow path
+            if self.workflow is None:
+                data = data.repeat(repeat_times=self.config.val_override_config.get("n", 1), interleave=True)
+            # After pop(), data.batch is an empty TensorDict whose internal
+            # state is corrupted (stale flat-buffer / offset metadata).
+            # Assigning keys into it via union then calling .cuda() produces
+            # wrong data.  Replace with a fresh empty TensorDict first.
+            if self.workflow is not None:
+                data.batch = TensorDict(source={}, batch_size=data.batch.batch_size)
             new_batch = data.union(gen_batch_output)
             return new_batch
         
@@ -151,7 +167,11 @@ class Rollout():
             data.batch["tgt_input_ids"] = saved_tgt_input_ids
 
         # repeat to align with repeated responses in rollout
-        data = data.repeat(repeat_times=self.config.n, interleave=True)
+        # workflow path already pre-expanded data by n; only repeat for non-workflow path
+        if self.workflow is None:
+            data = data.repeat(repeat_times=self.config.n, interleave=True)
+        else:
+            data.batch = TensorDict(source={}, batch_size=data.batch.batch_size)
         new_batch = data.union(gen_batch_output)
 
         # compute rewards first

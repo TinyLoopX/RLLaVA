@@ -203,21 +203,21 @@ def gather_batch(batch) -> DataProto:
     if batch is None:
         return None
     world_size = dist.get_world_size()
-    # All-gather on tensors requires identical shapes on every rank.
-    # If ranks produce different batch sizes, fall back to object gather.
+
     local_len = torch.tensor([len(batch)], device=torch.cuda.current_device(), dtype=torch.int64)
     len_list = [torch.empty_like(local_len) for _ in range(world_size)]
     dist.all_gather(len_list, local_len)
     lengths = [int(v.item()) for v in len_list]
+
     if len(set(lengths)) != 1:
         gathered = [None for _ in range(world_size)]
         dist.all_gather_object(gathered, batch, group=dist.group.WORLD)
         merged = DataProto.concat(gathered)
         if torch.cuda.is_available():
-            merged.to(torch.device("cuda", torch.cuda.current_device()))
+            merged = merged.to(torch.device("cuda", torch.cuda.current_device()))
         return merged
-    else:
-        all_gather_data_proto(batch, size=world_size, group=dist.group.WORLD)
+
+    all_gather_data_proto(batch, size=world_size, group=dist.group.WORLD)
     return batch
 
 def broadcast_object(
