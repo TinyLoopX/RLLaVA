@@ -15,10 +15,15 @@
 
 from .env_registry import initialize_env_from_config
 from .base import BaseEnv
-
+from .agentbay_browser_env import AgentBayBrowserEnv
+from .agentbay_computer_env import AgentBayComputerEnv
+from .agentbay_mobile_env import AgentBayMobileEnv
+from .osworld_subprocess_env import OSWorldSubprocessEnv
+from .androidworld_subprocess_env import AndroidWorldSubprocessEnv
 
 __all__ = [
     "initialize_env_from_config",
     "BaseEnv",
-
+    "OSWorldSubprocessEnv",
+    "AndroidWorldSubprocessEnv",
 ]

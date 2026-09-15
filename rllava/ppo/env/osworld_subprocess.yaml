@@ -1,0 +1,79 @@
+# OSWorld Subprocess Environment Configuration
+# Uses subprocess to run OSWorld in an isolated Python environment,
+# avoiding dependency conflicts with RLLAVA.
+#
+# Prerequisites:
+#   1. OSWorld installed in a separate conda environment
+#   2. A VM provider configured (volcengine, vmware, virtualbox, etc.)
+#   3. Update python_executable and osworld_dir to match your setup
+
+class_name: OSWorldSubprocessEnv
+
+config:
+  # --- Subprocess settings ---
+  # Path to OSWorld project root (contains desktop_env/, etc.)
+  osworld_dir: ./rllava/ppo/env/OSWorld-main
+
+  # Python executable in the OSWorld conda environment
+  # e.g., /home/user/miniconda3/envs/osworld/bin/python
+  python_executable: /data/mazihao/anaconda3/envs/osworld/bin/python
+  env_name: osworld
+  # When false, launch worker directly via python_executable.
+  # This is more stable for concurrent multi-session rollouts.
+  use_conda_run: false
+  # Timeout for starting worker and resetting environment (seconds)
+  startup_timeout: 12000
+
+  # Timeout for each step/evaluate command (seconds)
+  command_timeout: 300
+
+  # Reset resilience (RLAnything-style outer retry)
+  reset_max_retries: 10
+  reset_retry_backoff: 5.0
+  restart_worker_on_reset_failure: true
+
+  # --- VM Provider settings ---
+  # Provider: vmware, virtualbox, volcengine, docker, aws, gcp, azure
+  provider_name: docker
+
+  # Region for cloud providers (volcengine, aws, etc.)
+  region: null
+
+  # Path to VM file (for vmware/virtualbox providers, null for cloud)
+  path_to_vm: null
+
+  # Snapshot name to reset VM to
+  snapshot_name: init_state
+
+  # --- Environment settings ---
+  # Action space: pyautogui (python commands) or computer_13
+  action_space: pyautogui
+
+  # Screen resolution [width, height]
+  screen_size: [1920, 1080]
+
+  # Run VM in headless mode
+  headless: true
+
+  # Whether to capture accessibility tree (slower but more info)
+  require_a11y_tree: false
+
+  # Whether to capture terminal output
+  require_terminal: false
+
+  # Guest OS type
+  os_type: Ubuntu
+
+  # --- Timing settings ---
+  # Seconds to wait after env.reset() for the environment to stabilize
+  wait_after_reset: 5
+
+  # Seconds to wait after each action execution
+  sleep_after_execution: 3
+
+  # Seconds to wait before running evaluation
+  wait_before_eval: 5
+
+  # --- Episode settings ---
+  # Maximum steps per episode
+  max_steps: 30

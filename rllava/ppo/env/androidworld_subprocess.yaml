@@ -1,0 +1,55 @@
+# AndroidWorld Subprocess Environment Configuration
+# Uses subprocess to run AndroidWorld in an isolated Python environment,
+# avoiding dependency conflicts with RLLAVA.
+#
+# Prerequisites:
+#   1. AndroidWorld installed in a separate conda environment
+#   2. Android emulator running (or physical device connected via ADB)
+#   3. Update python_executable and android_world_dir to match your setup
+
+class_name: AndroidWorldSubprocessEnv
+
+config:
+  # --- Subprocess settings ---
+  # Path to AndroidWorld project root (contains android_world/, etc.)
+  android_world_dir: /path/to/android_world-main
+
+  # Python executable in the AndroidWorld conda environment
+  # e.g., /home/user/miniconda3/envs/androidworld/bin/python
+  python_executable: python
+
+  # Timeout for starting worker and resetting environment (seconds)
+  startup_timeout: 120
+
+  # Timeout for each step/evaluate command (seconds)
+  command_timeout: 120
+
+  # --- Android Emulator / ADB settings ---
+  # Emulator console port
+  console_port: 5554
+
+  # Path to adb binary
+  adb_path: ~/Android/Sdk/platform-tools/adb
+
+  # gRPC port for accessibility tree
+  grpc_port: 8554
+
+  # Whether to use env_launcher (recommended, handles setup/freeze)
+  use_launcher: true
+
+  # Whether to run emulator setup (first-time only)
+  emulator_setup: false
+
+  # Whether to freeze device datetime for reproducibility
+  freeze_datetime: true
+
+  # --- Timing settings ---
+  # Seconds to wait after env.reset() for the environment to stabilize
+  wait_after_reset: 3
+
+  # Seconds to wait before running evaluation
+  wait_before_eval: 3
+
+  # --- Episode settings ---
+  # Maximum steps per episode
+  max_steps: 30
