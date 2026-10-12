@@ -46,7 +46,16 @@ class Pipeline:
         )
 
         self.load_checkpoint()
-        
+
+    def iter_train_batches(self):
+        """Re-enter the dataloader each epoch without caching its batches.
+
+        The first traversal also respects a restored StatefulDataLoader cursor.
+        Later traversals run the sampler and dataset processing again.
+        """
+        while True:
+            yield from self.train_dataloader
+
     def save_checkpoint(self) -> None:
         # path: {save_checkpoint_path}/global_step_{global_step}/{actor,critic}
         if self.val_reward_score > self.best_val_reward_score:

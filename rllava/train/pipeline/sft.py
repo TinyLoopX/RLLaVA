@@ -1,5 +1,4 @@
 import torch
-import itertools
 import numpy as np
 import uuid
 from collections import defaultdict
@@ -177,16 +176,22 @@ class SFTPipeline(Pipeline):
             if self.config.trainer.val_only:
                 return
 
-        self.data_iterator = itertools.cycle(self.train_dataloader)
+        self.data_iterator = self.iter_train_batches()
         
-        for _ in tqdm(range(self.training_steps), initial=self.global_steps, desc="Training Progress", disable=not is_rank0()):
+        for _ in tqdm(
+            range(self.global_steps, self.training_steps),
+            initial=self.global_steps,
+            total=self.training_steps,
+            desc="Training Progress",
+            disable=not is_rank0(),
+        ):
             metrics, timing_raw = {}, {}
             with timer("step", timing_raw):
                 batch = dist_batch(self.data_iterator)
                 batch = self._prepare_sft_batch(batch)
 
                 with timer("update", timing_raw):
-                    output = self.model.update_model(batch, self.training_steps)
+                    output = self.model.update_model(batch, global_steps=self.global_steps)
                     
                 batch = gather_batch(batch)
                 output = gather_batch(output)
