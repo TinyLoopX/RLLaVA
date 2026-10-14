@@ -4,7 +4,7 @@ import time
 import torch
 from typing import Optional, List, Dict, Union, TYPE_CHECKING
 from packaging.version import InvalidVersion, Version
-from vllm import LLM, SamplingParams, RequestOutput
+from vllm import LLM, SamplingParams, RequestOutput, envs
 from vllm.lora.request import LoRARequest
 from peft.utils.save_and_load import get_peft_model_state_dict
 from dataclasses import asdict
@@ -13,7 +13,7 @@ from tensordict import TensorDict
 from transformers import PreTrainedTokenizer, ProcessorMixin, PreTrainedModel
 from contextlib import contextmanager
 from .. import register_engine
-from .base import InferenceEngine
+from .base import InferenceEngine, pack_rollout_log_probs, response_mask_from_lengths
 from .base import _get_logit_bias, _process_multi_modal_data, _repeat_interleave
 from .utils import TensorLoRARequest, VLLMHijack
 from rllava.data.protocol import DataProto
@@ -96,6 +96,11 @@ class VLLMEngine(InferenceEngine):
         apply_vllm_model_patches(model_name_or_path=model_name_or_path)
         
         VLLMHijack.hijack()
+
+        version = get_vllm_version()
+        if version is None or version < Version("0.11.0"):
+            raise ValueError("Rollout log probabilities require vLLM >= 0.11.0 with processed_logprobs support.")
+        self.engine_kwargs["logprobs_mode"] = "processed_logprobs"
         
         self.inference_engine = LLM(
             model=model_name_or_path,
@@ -117,6 +122,8 @@ class VLLMEngine(InferenceEngine):
             **self.lora_kwargs,
             **self.engine_kwargs,
         )
+        if not getattr(envs, "VLLM_USE_V1", True):
+            raise ValueError("Rollout log probabilities require the vLLM V1 engine (processed_logprobs).")
 
         # Offload vLLM model to reduce peak memory usage at init
         self.inference_engine.sleep(level=1)
@@ -146,12 +153,14 @@ class VLLMEngine(InferenceEngine):
                     old_sampling_params_args[key] = old_value
                     setattr(self.sampling_params, key, value)
 
-        yield
-        # roll back to previous sampling params
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
+        try:
+            yield
+        finally:
+            for key, value in old_sampling_params_args.items():
+                setattr(self.sampling_params, key, value)
 
     def generate(self, prompts: DataProto) -> DataProto:
+        temperature = prompts.meta_info.get("temperature", self.config.temperature)
         if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
             self.inference_engine.wake_up(tags=["kv_cache"]) 
 
@@ -193,13 +202,19 @@ class VLLMEngine(InferenceEngine):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/lora-path")
                 ] * batch_size
         
-        with self.update_sampling_params(**prompts.meta_info):
+        sampling_overrides = {**prompts.meta_info, "logprobs": 0}
+        with self.update_sampling_params(**sampling_overrides):
             completions: List[RequestOutput] = self.inference_engine.generate(
                 prompts=engine_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm, lora_request=lora_requests,
             )
-            response_ids = [output.token_ids for completion in completions for output in completion.outputs]
+            outputs = [output for completion in completions for output in completion.outputs]
+            token_ids = [list(output.token_ids) for output in outputs]
+            token_log_probs = [
+                [candidates[output.token_ids[i]].logprob for i, candidates in enumerate(output.logprobs)]
+                for output in outputs
+            ]
             response_ids = VF.pad_2d_list_to_length(
-                response_ids, self.pad_token_id, max_length=self.config.response_length
+                token_ids, self.pad_token_id, max_length=self.config.response_length
             ).to(input_ids.device)
 
             if self.sampling_params.n > 1:
@@ -219,10 +234,10 @@ class VLLMEngine(InferenceEngine):
 
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_mask = VF.get_response_mask(
-            response_ids=response_ids, eos_token_id=eos_token_id, dtype=attention_mask.dtype
+        response_mask = response_mask_from_lengths(
+            response_ids, [len(ids) for ids in token_ids], eos_token_id, dtype=attention_mask.dtype,
+            ignore_eos=prompts.meta_info.get("ignore_eos", self.config.ignore_eos),
         )
-        response_length = torch.sum(response_mask, dim=-1)
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
         batch = TensorDict(
@@ -236,6 +251,7 @@ class VLLMEngine(InferenceEngine):
             },
             batch_size=batch_size,
         )
+        batch.update(pack_rollout_log_probs(token_ids, token_log_probs, response_mask, temperature))
         if batch_multi_modal_data is not None:
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:
@@ -313,5 +329,3 @@ class VLLMEngine(InferenceEngine):
                 yield name, tensor.to(device, non_blocking=True).full_tensor() if (self.world_size != 1 or isinstance(tensor, DTensor)) else tensor
             else:
                 yield name, tensor 
-
-    

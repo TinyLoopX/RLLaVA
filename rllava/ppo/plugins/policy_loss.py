@@ -1,3 +1,4 @@
+import math
 import torch
 from omegaconf import DictConfig
 from rllava.ppo.config import AlgorithmConfig, ActorConfig
@@ -83,6 +84,16 @@ def get_policy_loss(name):
     return POLICY_LOSS_REGISTRY[loss_name]
 
 
+@torch.no_grad()
+def compute_tis_weights(old_log_probs, rollout_log_probs, response_mask, cap):
+    mask = response_mask.bool()
+    old = old_log_probs.detach().float().masked_fill(~mask, 0.0)
+    rollout = rollout_log_probs.detach().float().masked_fill(~mask, 0.0)
+    # Clamp in log space before exp: an extreme mismatch must not overflow.
+    weights = (old - rollout).clamp(max=math.log(cap)).exp()
+    return weights.masked_fill(~mask, 0.0)
+
+
 @register_policy_loss("vanilla")
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
@@ -133,7 +144,7 @@ def compute_policy_loss_vanilla(
         + f" but get the value: {clip_ratio_c}."
     )
 
-    negative_approx_kl = log_prob - old_log_prob
+    negative_approx_kl = torch.where(response_mask.bool(), log_prob - old_log_prob.detach(), 0.0)
     # Clamp negative_approx_kl for stability
     negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
     ratio = torch.exp(negative_approx_kl)
@@ -169,10 +180,9 @@ def compute_policy_loss_vanilla(
     else:
         pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
 
-    if config.tis_imp_ratio_cap > 0 and rollout_log_probs is not None:
+    if config.tis_imp_ratio_cap > 0:
         # Apply truncated importance sampling -> https://fengyao.notion.site/off-policy-rl
-        tis_imp_ratio = torch.exp(old_log_prob - rollout_log_probs)
-        tis_imp_ratio = torch.clamp(tis_imp_ratio, max=config.tis_imp_ratio_cap)
+        tis_imp_ratio = compute_tis_weights(old_log_prob, rollout_log_probs, response_mask, config.tis_imp_ratio_cap)
         pg_losses = pg_losses * tis_imp_ratio
 
     pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)

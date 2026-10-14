@@ -130,6 +130,7 @@ class Actor(PolicyRole):
             "attention_mask",
             "position_ids",
             "advantages",
+            "old_log_probs",
         ]
         for key in get_policy_loss_extra_keys(self.policy_loss):
             if key in data.batch.keys():
@@ -139,21 +140,10 @@ class Actor(PolicyRole):
             select_keys.append("ref_log_probs")
 
         if self.config.tis_imp_ratio_cap > 0:
-            assert "rollout_log_probs" in data.batch.keys(), (
-                "Truncated Importance Sampling (TIS) requires to configure "
-                "`actor_rollout_ref.rollout.calculate_log_probs=True` "
-                "and is not currently supported in Server mode (agent loop)."
-            )
             select_keys.append("rollout_log_probs")
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
-
-        # Calculate number of mini_batches to determine on_policy before actual data selection
-        on_policy = len(data) // self.config.ppo_mini_batch_size == 1 and self.config.ppo_epochs == 1
-
-        if not on_policy:
-            select_keys.append("old_log_probs")
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -206,10 +196,7 @@ class Actor(PolicyRole):
                         return_logits=False,
                     )
 
-                    if on_policy:
-                        old_log_probs = log_probs.detach()
-                    else:
-                        old_log_probs = model_inputs["old_log_probs"]
+                    old_log_probs = model_inputs["old_log_probs"].detach()
 
                     policy_loss_kwargs = build_policy_loss_kwargs(
                         self.policy_loss, model_inputs=model_inputs, metrics=micro_batch_metrics
@@ -269,7 +256,4 @@ class Actor(PolicyRole):
 
         self.optimizer.zero_grad()
         return metrics
-
-
-
 

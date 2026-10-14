@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 
 from collections import defaultdict
@@ -79,6 +80,8 @@ class PolicyRole(Role):
         calculate_entropy: bool = False,
         return_logits: bool = False,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        if temperature is None or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Actor/reference log probabilities require a finite positive temperature.")
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = self.prepare_multi_modal_inputs(micro_batch)
 
@@ -185,4 +188,3 @@ class PolicyRole(Role):
             entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)  # (bsz, response_length)
 
         return entropy, log_probs, logits_slice
-

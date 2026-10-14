@@ -31,7 +31,7 @@ from sglang_router.launch_router import RouterArgs, launch_router
 from tensordict import TensorDict
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from .. import register_engine
-from .base import InferenceEngine, _repeat_interleave, _process_multi_modal_data
+from .base import InferenceEngine, _process_multi_modal_data, pack_rollout_log_probs, response_mask_from_lengths
 from rllava.data.protocol import DataProto
 from rllava.utils import torch_functional as VF
 from rllava.utils.model_utils import print_gpu_memory_usage
@@ -178,7 +178,7 @@ class SGLangEngine(InferenceEngine):
             payload = {
                 "input_ids": list(raw_prompt_ids),
                 "sampling_params": {**sampling_params},
-                "return_logprob": prompts.meta_info.get("return_logprob", False),
+                "return_logprob": True,
             }
             if batch_multi_modal_data is not None:
                 processed_images = _process_multi_modal_data(
@@ -194,18 +194,8 @@ class SGLangEngine(InferenceEngine):
 
         return engine_inputs
 
-    @staticmethod
-    def _find_subsequence(sequence: Sequence[int], subsequence: Sequence[int]) -> int:
-        if not subsequence:
-            return 0
-        needle = list(subsequence)
-        limit = len(sequence) - len(needle) + 1
-        for idx in range(limit):
-            if sequence[idx : idx + len(needle)] == needle:
-                return idx
-        return -1
-
-    def _finalize_batch(self, prompts: DataProto, response_ids: List[List[int]]) -> DataProto:
+    def _finalize_batch(self, prompts: DataProto, response_ids: List[List[int]], token_log_probs: List[List[float]]) -> DataProto:
+        token_ids = response_ids
         response_ids = VF.pad_2d_list_to_length(
             response_ids, self.pad_token_id, max_length=self.config.response_length
         ).to(prompts.batch["input_ids"].device)
@@ -226,8 +216,9 @@ class SGLangEngine(InferenceEngine):
 
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_mask = VF.get_response_mask(
-            response_ids=response_ids, eos_token_id=eos_token_id, dtype=attention_mask.dtype
+        response_mask = response_mask_from_lengths(
+            response_ids, [len(ids) for ids in token_ids], eos_token_id, dtype=attention_mask.dtype,
+            ignore_eos=prompts.meta_info.get("ignore_eos", self.config.ignore_eos),
         )
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
@@ -242,6 +233,8 @@ class SGLangEngine(InferenceEngine):
             },
             batch_size=batch_size,
         )
+        temperature = prompts.meta_info.get("temperature", self.config.temperature)
+        batch.update(pack_rollout_log_probs(token_ids, token_log_probs, response_mask, temperature))
         if batch_multi_modal_data is not None:
             non_tensor_batch = {"multi_modal_data": batch_multi_modal_data}
         else:
@@ -255,13 +248,16 @@ class SGLangEngine(InferenceEngine):
             prompts = prompts.repeat(repeat_times=num_return_sequences, interleave=True)
 
         prepared = self._prepare_batch(prompts)
-        responses = self._collect_sync(prepared)
-        return self._finalize_batch(prompts, responses)
+        responses, log_probs = self._collect_sync(prepared)
+        return self._finalize_batch(prompts, responses, log_probs)
 
     async def agenerate(self, prompts: DataProto) -> DataProto:
+        num_return_sequences = prompts.meta_info.get("n", self.config.n)
+        if num_return_sequences > 1:
+            prompts = prompts.repeat(repeat_times=num_return_sequences, interleave=True)
         prepared = self._prepare_batch(prompts)
-        responses = await self._collect_async(prepared)
-        return self._finalize_batch(prompts, responses)
+        responses, log_probs = await self._collect_async(prepared)
+        return self._finalize_batch(prompts, responses, log_probs)
 
     def update_weights(self, model):
         weights = model.state_dict()
@@ -340,6 +336,11 @@ class SGLangEngine(InferenceEngine):
         # sync_request(self.router_url, "health", "GET", 10, 10)
 
     def _launch_server(self):
+        if any(
+            os.environ.get(key, "0").lower() in ("1", "true")
+            for key in ("RETURN_ORIGINAL_LOGPROB", "SGLANG_RETURN_ORIGINAL_LOGPROB")
+        ):
+            raise ValueError("Unset RETURN_ORIGINAL_LOGPROB / SGLANG_RETURN_ORIGINAL_LOGPROB to collect temperature-scaled probabilities.")
         server_args = ServerArgs(
             enable_memory_saver=True,
             host=get_host(),
@@ -435,96 +436,41 @@ class SGLangEngine(InferenceEngine):
             f"SGLang worker at {worker_url} failed health check after wake up. Last error: {last_error}"
         )
 
-    def _collect_sync(self, engine_inputs: List[Dict[str, Any]]) -> List[List[int]]:
+    def _collect_sync(self, engine_inputs: List[Dict[str, Any]]) -> Tuple[List[List[int]], List[List[float]]]:
         raw_responses: List[Any] = []
         print(f"sending request to {self.router_url}, workers: {self.worker_urls}")
         for payload in engine_inputs:
             raw_responses.extend(self._sync_adapter.generate(payload))
         return self._decode_responses(raw_responses)
 
-    async def _collect_async(self, engine_inputs: List[Dict[str, Any]]) -> List[List[int]]:
+    async def _collect_async(self, engine_inputs: List[Dict[str, Any]]) -> Tuple[List[List[int]], List[List[float]]]:
         raw_responses = await self._async_adapter.generate_batch(engine_inputs)
         return self._decode_responses(raw_responses)
 
-    def _decode_responses(self, raw_responses: Sequence[Any]) -> List[List[int]]:
+    def _decode_responses(self, raw_responses: Sequence[Any]) -> Tuple[List[List[int]], List[List[float]]]:
         collected: List[List[int]] = []
+        collected_log_probs = []
         for raw in raw_responses:
             responses = raw if isinstance(raw, list) else [raw]
             for resp in responses:
-                tokens = self._extract_response_tokens(resp)
+                # These IDs are authoritative. Re-encoding decoded text or
+                # stripping role/EOS tokens would change the sampled actions.
+                entries = resp["meta_info"]["output_token_logprobs"]
+                tokens, values = [], []
+                for entry in entries:
+                    if isinstance(entry, dict):
+                        token = entry.get("token_id", entry.get("token"))
+                        value = entry["logprob"]
+                    else:
+                        value, token = entry[:2]
+                    tokens.append(int(token))
+                    values.append(float(value))
+                output_ids = resp.get("output_ids", resp.get("meta_info", {}).get("output_ids"))
+                if output_ids is not None and list(output_ids) != tokens:
+                    raise ValueError("SGLang output_ids and output_token_logprobs are misaligned.")
+                collected_log_probs.append(values[: self.config.response_length])
                 collected.append(tokens[: self.config.response_length])
-        return collected
-
-    def _extract_response_tokens(self, response: Dict[str, Any]) -> List[int]:
-        if response is None:
-            return []
-
-        text_tokens: Optional[List[int]] = None
-        text = response.get("text")
-        if isinstance(text, str):
-            filtered = _strip_role_prefix(text)
-            text_tokens = (
-                self.tokenizer.encode(filtered, add_special_tokens=False) if filtered else []
-            )
-
-        if "output_ids" in response:
-            tokens = self._sanitize_output_ids(response["output_ids"])
-            if text_tokens is not None:
-                return self._align_tokens_with_text(tokens, text_tokens)
-            return tokens
-
-        meta_info = response.get("meta_info", {})
-        if "output_ids" in meta_info:
-            tokens = self._sanitize_output_ids(meta_info["output_ids"])
-            if text_tokens is not None:
-                return self._align_tokens_with_text(tokens, text_tokens)
-            return tokens
-
-        token_logprobs = meta_info.get("output_token_logprobs")
-        if token_logprobs:
-            tokens = []
-            for entry in token_logprobs:
-                if isinstance(entry, (list, tuple)):
-                    tokens.append(int(entry[1]))
-                elif isinstance(entry, dict):
-                    tokens.append(int(entry.get("token_id", entry.get("token", 0))))
-            if tokens:
-                return tokens
-
-        if text_tokens is not None:
-            return text_tokens
-        return []
-
-    def _sanitize_output_ids(self, token_ids: Sequence[int]) -> List[int]:
-        if not token_ids:
-            return []
-
-        eos_id = getattr(self.tokenizer, "eos_token_id", None)
-        pad_id = getattr(self.tokenizer, "pad_token_id", None)
-        start = 0
-        while start < len(token_ids):
-            token = token_ids[start]
-            if (eos_id is not None and token == eos_id) or (pad_id is not None and token == pad_id):
-                start += 1
-                continue
-            break
-        if start == 0:
-            return list(token_ids)
-        return list(token_ids[start:])
-
-    def _align_tokens_with_text(
-        self, candidate_tokens: List[int], text_tokens: List[int]
-    ) -> List[int]:
-        if not text_tokens:
-            return candidate_tokens
-        if not candidate_tokens:
-            return text_tokens
-
-        match_start = self._find_subsequence(candidate_tokens, text_tokens)
-        if match_start != -1:
-            return candidate_tokens[match_start:]
-
-        return text_tokens
+        return collected, collected_log_probs
 
     def _update_tensor_bucket(
             self, dtype_to_named_tensors: Dict[torch.dtype, List[Tuple[str, torch.Tensor]]]
@@ -617,14 +563,3 @@ def sync_request(
                 if trial == max_trials - 1:
                     raise
                 time.sleep(retry_delay)
-
-def _strip_role_prefix(text: str) -> str:
-    """Remove leading role markers like 'assistant' to match vLLM output."""
-    if not text:
-        return text
-    stripped = text.lstrip()
-    lowered = stripped.lower()
-    if lowered.startswith("assistant"):
-        stripped = stripped[len("assistant"):]
-        return stripped.lstrip(" :\n\t")
-    return stripped

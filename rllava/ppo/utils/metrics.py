@@ -14,10 +14,12 @@
 
 from typing import Any, Dict, List
 
+import math
 import numpy as np
 import torch
 
 from rllava.data.protocol import DataProto
+from rllava.ppo.plugins.policy_loss import compute_tis_weights
 
 
 def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
@@ -81,7 +83,28 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
-    metrics = {
+    rollout_mask = batch.batch["response_mask"].bool()
+    old = batch.batch["old_log_probs"].detach().float().masked_fill(~rollout_mask, 0.0)
+    rollout = batch.batch["rollout_log_probs"].detach().float().masked_fill(~rollout_mask, 0.0)
+    diff = (old - rollout)[rollout_mask]
+    metrics = {"rollout/valid_tokens": diff.numel()}
+    if diff.numel() > 0:
+        # The bounded ratio is diagnostic only; TIS uses its configured cap directly.
+        ratio = diff.clamp(-20, 20).exp()
+        metrics.update({
+            "rollout/log_prob_diff_mean": diff.mean().item(),
+            "rollout/log_prob_abs_diff_mean": diff.abs().mean().item(),
+            "rollout/log_prob_abs_diff_max": diff.abs().max().item(),
+            "rollout/importance_ratio_mean": ratio.mean().item(),
+            "rollout/importance_ratio_max": ratio.max().item(),
+            "rollout/ratio_log_clamp_fraction": (diff.abs() > 20).float().mean().item(),
+        })
+        cap = batch.meta_info.get("tis_imp_ratio_cap", -1)
+        if cap > 0:
+            metrics["rollout/tis_clip_fraction"] = (diff > math.log(cap)).float().mean().item()
+            metrics["rollout/tis_weight_mean"] = compute_tis_weights(old, rollout, rollout_mask, cap)[rollout_mask].mean().item()
+
+    metrics.update({
         # score
         "critic/score/mean": torch.mean(sequence_score).detach().item(),
         "critic/score/max": torch.max(sequence_score).detach().item(),
@@ -122,7 +145,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str
         "prompt_length/max": torch.max(prompt_length).detach().item(),
         "prompt_length/min": torch.min(prompt_length).detach().item(),
         "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
-    }
+    })
     return metrics
 
 

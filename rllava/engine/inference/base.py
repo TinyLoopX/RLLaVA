@@ -14,6 +14,37 @@ if TYPE_CHECKING:
     from rllava.ppo.config import RolloutConfig
 
 
+def response_mask_from_lengths(response_ids, lengths, eos_token_id, *, dtype, ignore_eos=False):
+    """Include the first EOS, but never include padding, even when pad == EOS."""
+    lengths = torch.as_tensor(lengths, device=response_ids.device)
+    mask = torch.arange(response_ids.shape[1], device=response_ids.device)[None, :] < lengths[:, None]
+    if eos_token_id is not None and not ignore_eos:
+        eos_ids = torch.as_tensor(eos_token_id, device=response_ids.device).reshape(-1)
+        is_eos = (response_ids[..., None] == eos_ids).any(-1) & mask
+        mask &= (is_eos.long().cumsum(-1) - is_eos.long()) == 0
+    return mask.to(dtype)
+
+
+def pack_rollout_log_probs(token_ids, token_log_probs, response_mask, temperature):
+    """Pad only after checking each generated token has its own probability."""
+    if len(token_ids) != response_mask.shape[0] or len(token_log_probs) != len(token_ids):
+        raise ValueError("Rollout response and log-probability batch sizes differ.")
+    log_probs = torch.zeros(response_mask.shape, dtype=torch.float32, device=response_mask.device)
+    for i, (ids, values) in enumerate(zip(token_ids, token_log_probs)):
+        if len(ids) != len(values):
+            raise ValueError(f"Token and log-probability counts differ for response {i}.")
+        log_probs[i, :len(values)] = torch.as_tensor(values, dtype=torch.float32, device=log_probs.device)
+    log_probs = log_probs.detach().masked_fill(~response_mask.bool(), 0.0)
+    if temperature == 0:
+        # Backend softmax scores are not the probability of a greedy action.
+        # The deterministic policy assigns probability 1 to the selected token.
+        log_probs.zero_()
+    return {
+        "rollout_log_probs": log_probs,
+        "rollout_temperature": torch.full((len(token_ids),), temperature, dtype=torch.float32, device=log_probs.device),
+    }
+
+
 def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> Union[torch.Tensor, np.ndarray]:
     # repeat the elements, supports both tensor and numpy array
     if isinstance(value, torch.Tensor):

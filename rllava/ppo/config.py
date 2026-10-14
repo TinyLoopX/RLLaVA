@@ -1,4 +1,5 @@
 import os
+import math
 from typing import Any, Dict, Optional, Union
 from dataclasses import asdict, dataclass, field
 from rllava.utils.config import BaseConfig, FSDPConfig, DeepSpeedConfig
@@ -250,10 +251,15 @@ class PPOConfig(BaseConfig):
         self.rollout.min_pixels = self.data.min_pixels
         self.rollout.max_pixels = self.data.max_pixels
         self.rollout.video_fps = self.data.video_fps
+        if not math.isfinite(self.actor.tis_imp_ratio_cap):
+            raise ValueError("actor.tis_imp_ratio_cap must be finite.")
+        if self.actor.tis_imp_ratio_cap > 0 and self.actor.policy_loss.loss_mode != "vanilla":
+            raise ValueError("TIS is currently supported only by actor.policy_loss.loss_mode=vanilla.")
+        if self.algorithm.prefix_strategy != "none" or self.algorithm.unify_strategy != "none":
+            raise ValueError("Rollout log probabilities cannot yet be used with prefix/demo response rewriting.")
         # normalize rollout.seed: "none"/"null" -> None, numeric string -> int
         if isinstance(self.rollout.seed, str):
             if self.rollout.seed.lower() in ("none", "null"):
                 self.rollout.seed = None
             else:
                 self.rollout.seed = int(self.rollout.seed)
-

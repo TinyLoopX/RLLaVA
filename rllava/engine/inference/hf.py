@@ -1,4 +1,5 @@
 import os
+import math
 import torch
 import logging
 import numpy as np
@@ -6,7 +7,7 @@ from tqdm import tqdm
 from typing import Optional, Dict, TYPE_CHECKING
 from collections import defaultdict
 from transformers import PreTrainedTokenizer, ProcessorMixin, AutoModelForVision2Seq, AutoModelForCausalLM, AutoConfig, GenerationConfig
-from .base import InferenceEngine
+from .base import InferenceEngine, pack_rollout_log_probs, response_mask_from_lengths
 from .. import register_engine
 from rllava.utils import torch_functional as VF
 from torch.distributed.tensor import DTensor
@@ -108,6 +109,8 @@ class HFEngine(InferenceEngine):
 
     def _generate_minibatch(self, prompts: DataProto) -> DataProto:
         temperature = prompts.meta_info.get("temperature", self.config.temperature)
+        if temperature is None or not math.isfinite(temperature) or temperature < 0:
+            raise ValueError("HF generation temperature must be finite and non-negative (0 for greedy).")
         response_length = prompts.meta_info.get("response_length", self.config.response_length)
         top_p = prompts.meta_info.get("top_p", getattr(self.config, "top_p", 1.0))
         top_k = max(0, prompts.meta_info.get("top_k", getattr(self.config, "top_k", 0)))  
@@ -139,7 +142,7 @@ class HFEngine(InferenceEngine):
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
-            "output_scores": False,  # this is potentially very large
+            "output_scores": True,  # required to recover probabilities of sampled tokens
             "return_dict_in_generate": True,
             "use_cache": True,
         }
@@ -164,6 +167,15 @@ class HFEngine(InferenceEngine):
                                         generation_config=self.generation_config)
         seq = output.sequences
         generated_batch_size = seq.size(0)  # bs * num_return_sequences
+        generated_length = seq.shape[1] - prompt_length
+        token_ids = seq[:, prompt_length:].tolist()
+        # Scores include the actual sampling processors and temperature.
+        # Gather one step at a time to avoid another B x R x vocabulary tensor.
+        selected = [
+            scores.float().log_softmax(-1).gather(1, seq[:, prompt_length + i, None]).squeeze(1)
+            for i, scores in enumerate(output.scores)
+        ]
+        token_log_probs = torch.stack(selected, dim=1).tolist() if selected else [[] for _ in token_ids]
 
         # huggingface generate will stop generating when all the batch reaches [EOS].
         # We have to pad to response_length
@@ -190,8 +202,8 @@ class HFEngine(InferenceEngine):
         response_position_ids = position_ids[..., -1:] + delta_position_id
         position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
 
-        response_mask = VF.get_response_mask(
-            response_ids=response, eos_token_id=eos_token_id, dtype=attention_mask.dtype
+        response_mask = response_mask_from_lengths(
+            response, [generated_length] * generated_batch_size, eos_token_id, dtype=attention_mask.dtype
         )
         attention_mask = torch.cat((attention_mask, response_mask), dim=-1)
 
@@ -206,6 +218,7 @@ class HFEngine(InferenceEngine):
             },
             batch_size=generated_batch_size,
         )
+        batch.update(pack_rollout_log_probs(token_ids, token_log_probs, response_mask, temperature))
         # empty cache before compute old_log_prob
         torch.cuda.empty_cache()
 

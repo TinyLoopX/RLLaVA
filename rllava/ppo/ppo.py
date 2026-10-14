@@ -190,17 +190,25 @@ class PPO():
         return self.reward.compute_rewards(data)
 
     def compute_log_probs(self, data: DataProto):
-        on_policy = len(data) // self.config.actor.ppo_mini_batch_size == 1 and self.config.actor.ppo_epochs == 1
-
         self._process_multi_modal_inputs(data)
-
-        if not on_policy:
-            output = self.actor.compute_log_probs(data, temperature=self.config.rollout.temperature)
-            data = data.union(DataProto.from_dict(tensors={"old_log_probs": output}))
+        temperature = self.config.rollout.temperature
+        temperatures = data.batch["rollout_temperature"]
+        if temperatures.shape != (data.batch["responses"].shape[0],) or not torch.allclose(
+            temperatures, torch.full_like(temperatures, temperature), rtol=1e-5, atol=1e-6
+        ):
+            raise ValueError("Rollout temperature differs from the temperature used to recompute actor probabilities.")
+        mask = data.batch["response_mask"].bool()
+        if mask.shape != data.batch["responses"].shape or not torch.equal(mask, data.batch["attention_mask"][:, -mask.shape[1]:].bool()):
+            raise ValueError("Response tokens, response_mask and attention_mask are misaligned.")
+        # Freeze the pre-update policy once, also for single-minibatch runs and
+        # KL-in-reward. The sampler probabilities remain a separate tensor.
+        output = self.actor.compute_log_probs(data, temperature=temperature)
+        data.batch["old_log_probs"] = output.detach().float().masked_fill(~mask, 0.0)
+        data.meta_info["tis_imp_ratio_cap"] = self.config.actor.tis_imp_ratio_cap
 
         # compute ref_log_probs if needed
         if self.ref is not None:
-            output = self.ref.compute_log_probs(data, temperature=self.config.rollout.temperature)
+            output = self.ref.compute_log_probs(data, temperature=temperature)
             data = data.union(DataProto.from_dict(tensors={"ref_log_probs": output}))
         return data
 
