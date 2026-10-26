@@ -21,8 +21,8 @@ logger.setLevel(os.getenv("RLLAVA_LOGGING_LEVEL", "WARN"))
 
 
 class Ref(PolicyRole):
-    def __init__(self, config: ActorConfig, tokenizer=None, processor=None):
-        super().__init__(config, tokenizer, processor)
+    def __init__(self, config: ActorConfig, tokenizer=None, processor=None, *, layout):
+        super().__init__(config, tokenizer, processor, layout=layout)
         self.model = None
 
     def initialize(self, actor: Actor):
@@ -48,9 +48,10 @@ class Ref(PolicyRole):
         data = data.select(select_keys, non_tensor_select_keys)
         if self.config.model.dynamic_batching:
             max_token_len = self.config.log_prob_micro_batch_size * data.batch["input_ids"].size(-1)
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len, dp_group=self.layout.groups.get("data"))
         else:
-            micro_batches = data.split(self.config.log_prob_micro_batch_size)
+            size = self.config.log_prob_micro_batch_size
+            micro_batches = [data[start:start + size] for start in range(0, len(data), size)]
 
         log_probs_lst = []
         if self.accelerator.is_main_process:

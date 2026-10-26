@@ -12,7 +12,7 @@ from rllava.model.config import ModelConfig, OptimConfig
 from rllava.utils.logger.aggregate_logger import print_rank_0
 from rllava.model.patch.monkey_patch import apply_monkey_patch
 from rllava.utils.train_utils import find_all_linear_names
-from rllava.utils.dist_utils import is_rank0
+from rllava.distribute.dist_utils import is_rank0
 from rllava.utils.torch_functional import get_constant_schedule_with_warmup, get_cosine_schedule_with_warmup
 from rllava.utils.model_utils import print_model_size
 

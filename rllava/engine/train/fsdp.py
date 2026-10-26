@@ -61,13 +61,15 @@ class FSDPAccelerator(TrainEngine):
     without breaking the current training stack.
     """
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, *, layout):
+        super().__init__(config, layout=layout)
         self.fsdp_config = getattr(config, "fsdp", FSDPConfig())
         self.checkpoint_config = getattr(config, "checkpoint", CheckpointConfig())
 
         self.device_mesh = create_device_mesh(world_size=self.world_size, 
                                               fsdp_size=self.fsdp_config.fsdp_size)
+
+        self.layout.groups["parameter_mesh"] = self.device_mesh
 
         self.wrapped_models: list[FSDP] = []
         self.optimizers: list[Optimizer] = []

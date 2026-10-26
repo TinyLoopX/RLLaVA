@@ -1,7 +1,7 @@
 import torch
 import os
 import numpy as np
-import torch.distributed as dist
+from dataclasses import replace
 from contextlib import contextmanager
 from collections import defaultdict
 from .config import PPOConfig
@@ -14,11 +14,9 @@ from .utils.core_algos import kl_penalty, get_kl_controller
 from rllava.data.protocol import DataProto
 from rllava.data.data_utils import process_image, process_video
 from rllava.utils import torch_functional as VF
-from rllava.utils.dist_utils import (
-    dist_gather_then_scatter,
-    dist_batch,
-    gather_batch,
-)
+from rllava.distribute.resource_manager import ResourceManager
+from rllava.distribute.batch_dispatcher import BatchDispatcher
+from rllava.distribute.dist_utils import on_coordinator
 from rllava.utils.logger.aggregate_logger import print_rank_0
 
 
@@ -31,6 +29,13 @@ class PPO():
         self.tokenizer = tokenizer
         self.processor = processor
         self._cache = {}
+        self.resources = ResourceManager.from_config(config)
+        self.dispatcher = BatchDispatcher(self.resources)
+        rollout_layout = self.resources.roles["rollout"]
+        print_rank_0(
+            f"Using {self.resources.world_size} GPUs for training; generation uses "
+            f"{rollout_layout.dp_size} replicas with {rollout_layout.parallel.tp_size} GPUs each."
+        )
 
         if config.algorithm.use_kl_in_reward and config.algorithm.use_kl_loss:
             print("NOTICE: You have both enabled in-reward kl and kl loss.")
@@ -40,45 +45,22 @@ class PPO():
 
         self.use_critic = self.config.critic is not None
         
-        if self.config.data.train_batch_size % self.config.actor.ppo_mini_batch_size != 0:
-            raise ValueError("Rollout batch size must be divisible by actor global batch size.")
-        
-        if (
-            self.config.data.train_batch_size * self.config.rollout.n
-        ) % self.config.actor.log_prob_micro_batch_size != 0:
-            raise ValueError(
-                "Rollout batch size * rollout.n must be divisible by actor micro batch size for experience."
-            )
-        
-        self.config.actor.ppo_mini_batch_size *= config.rollout.n
-        print_rank_0(f"Actor will use global batch size {self.config.actor.ppo_mini_batch_size}.")
-
-        if self.use_critic:
-            if self.config.data.train_batch_size % self.config.critic.ppo_mini_batch_size != 0:
-                raise ValueError("Rollout batch size must be divisible by critic global batch size.")
-
-            if (
-                self.config.data.train_batch_size * self.config.rollout.n
-            ) % self.config.critic.log_prob_micro_batch_size != 0:
-                raise ValueError(
-                    "Rollout batch size * rollout.n must be divisible by critic micro batch size for experience."
-                )
-
-        # Injected plugins/components (with sensible fallbacks)
         self.adv_estimator = adv_estimator
-
-        self.actor = Actor(config.actor, 
-                           tokenizer=tokenizer,
-                           processor=processor,
-                           policy_loss=policy_loss)
-        self.critic = Critic(config.critic, 
-                             tokenizer=tokenizer, 
-                             processor=processor) if config.critic is not None else None
+        actor_layout = self.resources.roles["actor"]
+        actor_config = replace(config.actor, ppo_mini_batch_size=config.actor.ppo_mini_batch_size * config.rollout.n // actor_layout.dp_size)
+        self.actor = Actor(actor_config, tokenizer=tokenizer, processor=processor,
+                           policy_loss=policy_loss, layout=actor_layout)
+        self.critic = None
+        if self.use_critic:
+            critic_layout = self.resources.roles["critic"]
+            critic_config = replace(config.critic, ppo_mini_batch_size=config.critic.ppo_mini_batch_size // critic_layout.dp_size)
+            self.critic = Critic(critic_config, tokenizer=tokenizer, processor=processor, layout=critic_layout)
 
         self.ref = None
-        if config.algorithm.use_kl_loss or config.algorithm.use_kl_in_reward:
-            if not self.actor.config.model.use_peft:
-                self.ref = Ref(config.actor, tokenizer=tokenizer, processor=processor)
+        if (config.algorithm.use_kl_loss or config.algorithm.use_kl_in_reward) and not config.actor.model.use_peft:
+            ref_config = replace(actor_config, parallel=self.resources.roles["ref"].parallel)
+            self.ref = Ref(ref_config, tokenizer=tokenizer, processor=processor,
+                           layout=self.resources.roles["ref"])
 
         self.reward = reward
         self.rollout = rollout
@@ -108,7 +90,7 @@ class PPO():
         self.train_dataloader = train_dataloader
         self.training_steps = self.get_training_steps(train_dataloader)
 
-        self.rollout.initialize(self.config.actor.model.model_path)
+        self.rollout.initialize(self.config.actor.model.model_path, self.dispatcher)
 
         self.config.actor.optim.training_steps = self.training_steps
         self.actor.initialize()
@@ -143,43 +125,46 @@ class PPO():
             self.critic.save_checkpoint(critic_path, save_model_only=self.config.trainer.save_model_only)
 
     def rollout_batch(self, data_iterator, global_step: int | None = None) -> DataProto:
-        batch = None
-        num_try_make_batch = 0
-        print_rank_0("Start generating batch...")
+        def collect():
+            batches, count, attempts = [], 0, 0
+            target = self.train_batch_size * self.rollout.n
+            while count < target:
+                attempts += 1
+                data = DataProto.from_single_dict(next(data_iterator))
+                batch = self.rollout.generate_one_batch(data, self.filter, global_step=global_step)
+                if len(batch):
+                    batches.append(batch)
+                    count += len(batch)
+                limit = self.config.trainer.max_try_make_batch
+                if count < target and 0 < limit <= attempts:
+                    raise RuntimeError(f"Online filtering collected {count}/{target} responses after {attempts} attempts.")
+            batch = DataProto.concat(batches)[:target]
+            batch.meta_info["global_token_num"] = batch.batch["attention_mask"].sum(-1).tolist()
+            return batch
+
         with self.generate_context():
-            while True:
-                num_try_make_batch += 1
-                batch_in = dist_batch(data_iterator)
+            batch = self.rollout.run(collect)
+        return self._to_training_device(self.dispatcher.scatter(batch))
 
-                new_batch = self.rollout.generate_one_batch(batch_in, self.filter, global_step=global_step)
-                new_batch = gather_batch(new_batch)
+    @staticmethod
+    def _to_training_device(data):
+        return data.to(torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else "cpu")
 
-                batch = DataProto.concat([batch, new_batch]) if batch is not None else new_batch
-                current_batch_size = len(batch) // self.rollout.n
-                rollout_batch_size = self.train_batch_size
-                if current_batch_size < rollout_batch_size:
-                    print_rank_0(f"{current_batch_size=} < {rollout_batch_size=}")
-                    max_try_make_batch = self.config.trainer.max_try_make_batch
-                    if max_try_make_batch <= 0 or num_try_make_batch < max_try_make_batch:
-                        print_rank_0(f"{num_try_make_batch=}. Continue generating...")
-                    else:
-                        raise ValueError(f"{num_try_make_batch=} >= {max_try_make_batch=}." + " Generated too many. Please check if your data are too difficult." + " You could also try set max_num_gen_batches=0 to enable endless trials.")
-                else:
-                    print_rank_0(f"{current_batch_size=} >= {rollout_batch_size=}. Finish generating.")
-                    result = batch[: self.train_batch_size * self.rollout.n]
-                    result.meta_info["global_token_num"] = torch.sum(result.batch["attention_mask"], dim=-1).tolist()
-                    result = result.chunk(dist.get_world_size())[dist.get_rank()]
-                    return result
-
-        
     @contextmanager
     def generate_context(self):
-        
         with self.actor.unwrap_model_for_generation() as unwrapped_model:
             self.rollout.rollout_engine.load(unwrapped_model)
+        try:
+            yield
+        finally:
+            self.rollout.rollout_engine.offload()
 
-        yield
-        self.rollout.rollout_engine.offload()
+    def close(self):
+        try:
+            if self.rollout.rollout_engine is not None:
+                self.rollout.rollout_engine.close()
+        finally:
+            self.resources.close()
 
     def compute_values(self, data: DataProto):
         self._process_multi_modal_inputs(data)
@@ -248,8 +233,15 @@ class PPO():
         
         return data, metrics
     
-    @dist_gather_then_scatter()
     def compute_advantage(self, data: DataProto):
+        # Rebuild derived model inputs from the local cache after redistribution.
+        data.non_tensor_batch.pop("multi_modal_inputs", None)
+        batch = self.dispatcher.gather(data)
+        batch = on_coordinator(lambda: self._compute_advantage(batch),
+                               src=self.resources.coordinator_rank, group=self.resources.control_group)
+        return self._to_training_device(self.dispatcher.scatter(batch))
+
+    def _compute_advantage(self, data: DataProto):
         adv_metrics = {}
         # apply kl penalty if needed
         if self.config.algorithm.use_kl_in_reward:
@@ -279,6 +271,8 @@ class PPO():
         if self.config.trainer.critic_warmup <= global_steps:
             actor_output = self.actor.update(data)
             outputs.append(actor_output)
+
+        data.non_tensor_batch.pop("multi_modal_inputs", None)
 
         if len(outputs) == 0:
             return DataProto()

@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass, field
 from rllava.utils.config import BaseConfig, FSDPConfig, DeepSpeedConfig
 from rllava.model.config import ModelConfig, OptimConfig, CheckpointConfig
 from rllava.engine import VLLMConfig, SGLangConfig
+from rllava.distribute.resource_manager import ParallelConfig
     
 
 
@@ -15,7 +16,7 @@ class RolloutConfig:
     temperature: float = 1.0
     top_p: float = 1.0
     top_k: int = -1
-    tensor_parallel_size: int = 1
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
     seed: Optional[Union[int, str]] = 1  # int, or "none"/"null" for random seed
     limit_images: int = 0
     ignore_eos: bool = False
@@ -73,6 +74,7 @@ class RewardConfig:
 
 @dataclass
 class CriticConfig:
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
     strategy: str = "fsdp2"
     ppo_mini_batch_size: int = 256
     """number of samples per minibatch for updating critic"""
@@ -119,6 +121,7 @@ class PolicyLossConfig:
 
 @dataclass
 class ActorConfig:
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
     strategy: str = "fsdp2"
     ppo_mini_batch_size: int = 256
     """number of samples per minibatch for updating actor"""
@@ -236,10 +239,16 @@ class AlgorithmConfig:
 
 
 @dataclass
+class RefConfig:
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
+
+
+@dataclass
 class PPOConfig(BaseConfig):
     algorithm: AlgorithmConfig = field(default_factory=AlgorithmConfig)
     actor: ActorConfig = field(default_factory=ActorConfig)
     critic: Optional[CriticConfig] = None
+    ref: Optional[RefConfig] = None
     reward: RewardConfig = field(default_factory=RewardConfig)
     rollout: RolloutConfig = field(default_factory=RolloutConfig)
 

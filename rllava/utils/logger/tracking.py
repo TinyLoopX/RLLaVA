@@ -16,7 +16,7 @@ A unified tracking interface that supports logging data to different backend
 """
 
 import dataclasses
-from rllava.utils.dist_utils import is_rank0, dist_rank0
+from rllava.distribute.dist_utils import is_rank0, dist_rank0
 from enum import Enum
 from functools import partial
 from pathlib import Path

@@ -9,7 +9,6 @@ from rllava.utils import pkg_version
 class SGLangConfig:
     dtype: str = "bfloat16"
     mem_fraction_static: Optional[float] = 0.6
-    tp_size: int = 1  
     skip_server_warmup: bool = False
 
     def to_dict(self):

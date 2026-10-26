@@ -30,19 +30,12 @@ logger.setLevel(os.getenv("RLLAVA_LOGGING_LEVEL", "WARN"))
 
 
 class Actor(PolicyRole):
-    def __init__(self, config: ActorConfig, tokenizer=None, processor=None, policy_loss=None):
-        super().__init__(config, tokenizer, processor)
+    def __init__(self, config: ActorConfig, tokenizer=None, processor=None, policy_loss=None, *, layout):
+        super().__init__(config, tokenizer, processor, layout=layout)
         self.policy_loss = policy_loss
         self.optimizer = None
         self.lr_scheduler = None
 
-        self.config.ppo_mini_batch_size = self.config.ppo_mini_batch_size // self.accelerator.num_processes
-        if self.config.ppo_mini_batch_size == 0:
-            raise ValueError(f"Actor mini batch size on per device must be larger than 0.")
-
-        if self.config.ppo_mini_batch_size % self.config.ppo_micro_batch_size != 0:
-            raise ValueError(f"Actor mini batch size on per device must be divisible by the micro batch size.")
-        
         print_rank_0(f"Actor will use mini batch size on per device {self.config.ppo_mini_batch_size}.")
 
     def initialize(self):
@@ -67,9 +60,10 @@ class Actor(PolicyRole):
         data = data.select(select_keys, non_tensor_select_keys)
         if self.config.model.dynamic_batching:
             max_token_len = self.config.log_prob_micro_batch_size * data.batch["input_ids"].size(-1)
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len, dp_group=self.layout.groups.get("data"))
         else:
-            micro_batches = data.split(self.config.log_prob_micro_batch_size)
+            size = self.config.log_prob_micro_batch_size
+            micro_batches = [data[start:start + size] for start in range(0, len(data), size)]
 
         log_probs_lst = []
         if self.accelerator.is_main_process:
@@ -157,7 +151,7 @@ class Actor(PolicyRole):
                 if self.config.model.dynamic_batching:
                     max_input_len = mini_batch.batch["input_ids"].size(-1)
                     max_token_len = self.config.ppo_micro_batch_size * max_input_len
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len, dp_group=self.layout.groups.get("data"))
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size

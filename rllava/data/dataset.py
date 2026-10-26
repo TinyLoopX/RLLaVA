@@ -21,7 +21,7 @@ from .image_preprocess import ImagePreprocess
 from rllava.utils.arguments import DataArguments
 from rllava.data.data_utils import process_image, process_video
 from rllava.utils.constants import *
-from rllava.utils import dist_utils
+from rllava.distribute import dist_utils
 
 
 

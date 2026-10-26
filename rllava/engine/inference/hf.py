@@ -35,8 +35,9 @@ class HFEngine(InferenceEngine):
         config: 'RolloutConfig',
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
+        layout,
     ):
-        super().__init__(model_name_or_path, config, tokenizer, processor)
+        super().__init__(model_name_or_path, config, tokenizer, processor, layout)
         self.model = None
         self.loaded = False
 
@@ -236,8 +237,8 @@ class HFEngine(InferenceEngine):
         prompts = prompts.repeat(repeat_times=num_return_sequences, interleave=True)
         
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // getattr(self.config, "micro_batch_size", batch_size), 1)
-        batch_prompts = prompts.chunk(chunks=num_chunks)
+        micro_batch_size = self.config.micro_batch_size
+        batch_prompts = [prompts[start:start + micro_batch_size] for start in range(0, batch_size, micro_batch_size)]
         
         # Add progress bar for batch processing
         batch_prompts_iter = tqdm(

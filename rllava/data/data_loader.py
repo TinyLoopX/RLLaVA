@@ -26,7 +26,7 @@ from torch.utils.data.distributed import DistributedSampler
 from .dataset import RLHFDataset
 from .data_utils import collate_fn
 from .config import DataConfig
-from rllava.utils.dist_utils import is_rank0
+from rllava.distribute.dist_utils import is_rank0
 from rllava.utils.import_utils import load_extern_type
 
 

@@ -87,6 +87,19 @@ torchrun -m rllava.train.pipeline.rlvr \
 
 For detailed usage instructions, please refer to `examples/README.md`
 
+### Single-node multi-GPU execution
+
+Use torchrun to select the GPU count. Training uses the selected FSDP/FSDP2/ZeRO backend; generation defaults to one replica per GPU. For vLLM or SGLang, set the number of GPUs per generation replica:
+
+```bash
+torchrun --nproc_per_node=4 -m rllava.train.pipeline.rlvr \
+  config=examples/config.yaml rollout.gpus_per_replica=2
+```
+
+This assigns two GPUs to each of two generation replicas, while all four GPUs process separate training samples. HF generation uses one GPU per replica. `rollout.parallel.tp_size` is the equivalent advanced setting; the previous `rollout.tensor_parallel_size` and `rollout.sglang.tp_size` configuration keys remain accepted by the config loader.
+
+Resource layouts and batch dispatch live in `rllava/distribute/`. Training TP/CP/SP/PP/EP are not enabled by this refactor; unsupported combinations fail before models or services start. CPU/Gloo control-plane tests can be run with `python -m unittest discover -s tests -p 'test_distribute.py' -v`. Real GPU backend validation is still required.
+
 ## 📦 Supported Scope
 
 ### Algorithms

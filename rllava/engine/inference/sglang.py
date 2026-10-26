@@ -6,9 +6,7 @@ import asyncio
 import requests
 import aiohttp
 import torch
-import multiprocessing
 import torch.distributed as dist
-from datetime import timedelta
 from collections import defaultdict
 from typing import (
     Tuple,
@@ -24,10 +22,9 @@ from typing import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.entrypoints.http_server_engine import launch_server_process
 from sglang.srt.patch_torch import monkey_patch_torch_reductions
-from sglang.srt.utils import  MultiprocessingSerializer
+from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from torch.distributed.tensor import DTensor, Replicate
-from sglang_router.launch_router import RouterArgs, launch_router
 from tensordict import TensorDict
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from .. import register_engine
@@ -36,7 +33,7 @@ from rllava.data.protocol import DataProto
 from rllava.utils import torch_functional as VF
 from rllava.utils.model_utils import print_gpu_memory_usage
 from rllava.utils.transformers_compat import is_transformers_version_in_range
-from rllava.utils.dist_utils import is_rank0, broadcast_object, gather_and_concat_list
+from rllava.distribute.dist_utils import dist_barrier
 from rllava.utils.device import get_device_id
 from rllava.data.data_utils import image2base64
 
@@ -46,11 +43,11 @@ from rllava.data.data_utils import image2base64
 class _SyncGenerateAdapter:
     """Simple synchronous adapter that issues blocking HTTP requests."""
 
-    def __init__(self, router_url: str):
-        self.router_url = router_url
+    def __init__(self, worker_url: str):
+        self.worker_url = worker_url
 
     def generate(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        response = sync_request(self.router_url, "generate", json=payload, retry_delay=10)
+        response = sync_request(self.worker_url, "generate", json=payload, retry_delay=10)
         if isinstance(response, list):
             return response
         return [response]
@@ -59,8 +56,8 @@ class _SyncGenerateAdapter:
 class _AsyncGenerateAdapter:
     """Adapter that issues concurrent HTTP requests via aiohttp."""
 
-    def __init__(self, router_url: str, max_trials: int = 3, retry_delay: float = 1.0):
-        self.router_url = router_url
+    def __init__(self, worker_url: str, max_trials: int = 3, retry_delay: float = 1.0):
+        self.worker_url = worker_url
         self.max_trials = max_trials
         self.retry_delay = retry_delay
         self._session: Optional[aiohttp.ClientSession] = None
@@ -78,7 +75,7 @@ class _AsyncGenerateAdapter:
     async def _post(self, endpoint: str, payload: Dict[str, Any]) -> Any:
         await self._ensure_session()
         assert self._session is not None
-        url = f"{self.router_url}/{endpoint}"
+        url = f"{self.worker_url}/{endpoint}"
 
         for trial in range(self.max_trials):
             try:
@@ -103,9 +100,6 @@ if TYPE_CHECKING:
     from rllava.ppo.config import RolloutConfig
 
 
-PROCESSES = []
-
-
 @register_engine("sglang")
 class SGLangEngine(InferenceEngine):
 
@@ -115,44 +109,24 @@ class SGLangEngine(InferenceEngine):
         config: 'RolloutConfig',
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
+        layout,
     ):
-        super().__init__(model_name_or_path, config, tokenizer, processor)
+        super().__init__(model_name_or_path, config, tokenizer, processor, layout)
 
-        self.gloo_group = dist.new_group(
-            ranks=list(range(self.world_size)),
-            timeout=timedelta(seconds=36000),
-            backend="gloo"
-        )
-
-        self.device_mesh = dist.device_mesh.init_device_mesh(
-            "cpu",
-            mesh_dim_names=("dp", "tp"),
-            mesh_shape=(self.world_size // self.tp_size, self.tp_size)
-        )
-
-        self._prepare_environment_variables()
-        
-        self._sync_adapter: Optional[_SyncGenerateAdapter] = None
-        self._async_adapter: Optional[_AsyncGenerateAdapter] = None
-
-        if self.device_mesh["tp"].get_local_rank() == 0:
+        self.gloo_group = layout.groups.get("control")
+        self.replica_group = layout.groups.get("replica")
+        self.tp_cuda_visible_devices = ",".join(layout.replica_devices)
+        self.server_process = None
+        self._sync_adapter = None
+        self._async_adapter = None
+        monkey_patch_torch_reductions()
+        if self.layout.tp_rank == 0:
             self._launch_server()
-            # self._sleep()
+            self._sync_adapter = _SyncGenerateAdapter(self.worker_url)
+            self._async_adapter = _AsyncGenerateAdapter(self.worker_url)
+            self._sleep()
         self.loaded = False
-
-        dist.barrier(self.gloo_group)
-    
-        if is_rank0():
-            self._launch_router()
-
-        self.router_url = broadcast_object(
-            self.router_url if dist.get_rank() == 0 else None,
-            process_group=self.device_mesh["dp"].get_group(),
-            group_src=0
-        )
-        # Default adapters
-        self._sync_adapter = _SyncGenerateAdapter(self.router_url)
-        self._async_adapter = _AsyncGenerateAdapter(self.router_url)
+        dist_barrier(self.gloo_group)
 
     def _build_sampling_params(self, meta_info: Dict[str, Any]) -> Dict[str, Any]:
         params = {
@@ -296,13 +270,13 @@ class SGLangEngine(InferenceEngine):
         torch.cuda.empty_cache()
         assert self.loaded is False, "sglang engine has already been loaded"
 
-        dist.barrier(self.gloo_group)
+        dist_barrier(self.gloo_group)
         print_gpu_memory_usage("Before sglang wake up in sglang engine")
         
-        # self._wake_up(tags=["weights"])
+        self._wake_up(tags=["weights"])
         self.update_weights(model)
-        # self._wake_up(tags=["kv_cache"])
-        dist.barrier(self.gloo_group)
+        self._wake_up(tags=["kv_cache"])
+        dist_barrier(self.gloo_group)
 
         print_gpu_memory_usage("After sglang wake up in sglang engine")
         self.loaded = True
@@ -310,30 +284,17 @@ class SGLangEngine(InferenceEngine):
     def offload(self):
         assert self.loaded is True, "sglang engine has not been loaded"
 
-        dist.barrier(self.gloo_group)
-        # print_gpu_memory_usage("Before sglang offload in sglang engine")
-        # self._sleep()
-        # print_gpu_memory_usage("After sglang offload in sglang engine")
+        dist_barrier(self.gloo_group)
+        self._sleep()
+        dist_barrier(self.gloo_group)
 
         torch.cuda.empty_cache()
         self.loaded = False
 
-    def _launch_router(self):
-        router_args = RouterArgs(
-            host=get_host(),
-            port=get_available_port(),
-            worker_urls=self.worker_urls,
-            log_level="error"
-        )
-        self.router_url = f"http://{router_args.host}:{router_args.port}"
-        print(f"Router URL: {self.router_url}")
-
-        router_process = multiprocessing.Process(
-            target=launch_router, args=(router_args,)
-        )
-        router_process.start()
-        PROCESSES.append(router_process)
-        # sync_request(self.router_url, "health", "GET", 10, 10)
+    def close(self):
+        if self.server_process is not None:
+            kill_process_tree(self.server_process.pid)
+            self.server_process = None
 
     def _launch_server(self):
         if any(
@@ -346,75 +307,40 @@ class SGLangEngine(InferenceEngine):
             host=get_host(),
             port=get_available_port(),
             model_path=self.model,
+            tp_size=self.tp_size,
             log_level="error",
             **self.config.sglang.to_dict()
         )
 
-        ori_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
-        os.environ["CUDA_VISIBLE_DEVICES"] = self.tp_cuda_visible_devices
-        server_process = launch_server_process(server_args)
-        os.environ["CUDA_VISIBLE_DEVICES"] = ori_devices
-
-        PROCESSES.append(server_process)
-
+        # Only the spawned server inherits its own device/rendezvous environment.
+        keys = ("CUDA_VISIBLE_DEVICES", "RANK", "WORLD_SIZE", "LOCAL_RANK", "LOCAL_WORLD_SIZE",
+                "GROUP_RANK", "ROLE_RANK", "ROLE_WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+                "TORCHELASTIC_USE_AGENT_STORE")
+        previous = {key: os.environ.get(key) for key in keys}
+        try:
+            for key in keys:
+                os.environ.pop(key, None)
+            os.environ["CUDA_VISIBLE_DEVICES"] = self.tp_cuda_visible_devices
+            self.server_process = launch_server_process(server_args)
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
         self.worker_url = server_args.url()
-        self.worker_urls = gather_and_concat_list(
-            [self.worker_url],
-            self.device_mesh["dp"].get_group()
-        )
 
-    def _prepare_environment_variables(self):
+    def _sleep(self, tags=("weights", "kv_cache")):
+        if self.layout.tp_rank == 0:
+            sync_request(self.worker_url, "release_memory_occupation", json={"tags": list(tags)})
 
-        if "TORCHELASTIC_USE_AGENT_STORE" in os.environ.keys():
-            del os.environ["TORCHELASTIC_USE_AGENT_STORE"]
-
-        cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-        if cuda_visible_devices:
-            cuda_visible_devices = cuda_visible_devices.split(",")
-            cuda_visible_device = cuda_visible_devices[int(os.environ["LOCAL_RANK"])]
-        else:
-            cuda_visible_device = os.environ["LOCAL_RANK"]
-
-        tp_visible_devices = self.device_mesh["tp"].size() * [None]
-        dist.all_gather_object(
-            tp_visible_devices,
-            cuda_visible_device,
-            self.device_mesh["tp"].get_group(),
-        )
-
-        # Cache the ordered device list for later use when spawning server processes.
-        self.tp_cuda_visible_devices = ",".join(tp_visible_devices)
-        monkey_patch_torch_reductions()
-
-    def _sleep(self, tags=["weights", "kv_cache"]) -> None:
-        if self.config.async_mode:
-            return
-
-        if self.device_mesh["tp"].get_local_rank() != 0:
-            return
-
-        try:
-            sync_request(self.worker_url, "release_memory_occupation", json={"tags": tags})
-        except Exception as exc:
-            print(f"[SGLangEngine] Failed to call release_memory_occupation on {self.worker_url}: {exc}")
-
-    def _wake_up(self, tags=["weights", "kv_cache"]) -> None:
-        if self.config.async_mode:
-            return
-
-        if self.device_mesh["tp"].get_local_rank() != 0:
-            return
-
-        try:
-            print_gpu_memory_usage(f"Before sglang wake up {tags} in sglang engine")
-            sync_request(self.worker_url, "resume_memory_occupation", json={"tags": tags})
-            print_gpu_memory_usage(f"After sglang wake up {tags} in sglang engine")
+    def _wake_up(self, tags=("weights", "kv_cache")):
+        if self.layout.tp_rank == 0:
+            sync_request(self.worker_url, "resume_memory_occupation", json={"tags": list(tags)})
             self._wait_worker_ready()
-        except Exception as exc:
-            print(f"[SGLangEngine] Failed to call resume_memory_occupation on {self.worker_url}: {exc}")
 
     def _wait_worker_ready(self, timeout: float = 300.0, interval: float = 1.0) -> None:
-        if self.device_mesh["tp"].get_local_rank() != 0:
+        if self.layout.tp_rank != 0:
             return
         worker_url = getattr(self, "worker_url", None)
         if not worker_url:
@@ -426,7 +352,7 @@ class SGLangEngine(InferenceEngine):
         while time.time() < end_time:
             try:
                 # sync_request(worker_url, endpoint, method="GET", max_trials=1, retry_delay=interval)
-                sync_request(self.router_url, "health", "GET", 1, interval)
+                sync_request(self.worker_url, "health", "GET", 1, interval)
                 return
             except Exception as exc:  # noqa: PERF203
                 last_error = exc
@@ -438,7 +364,7 @@ class SGLangEngine(InferenceEngine):
 
     def _collect_sync(self, engine_inputs: List[Dict[str, Any]]) -> Tuple[List[List[int]], List[List[float]]]:
         raw_responses: List[Any] = []
-        print(f"sending request to {self.router_url}, workers: {self.worker_urls}")
+        print(f"sending request to {self.worker_url}")
         for payload in engine_inputs:
             raw_responses.extend(self._sync_adapter.generate(payload))
         return self._decode_responses(raw_responses)
@@ -492,20 +418,19 @@ class SGLangEngine(InferenceEngine):
             )
 
         gathered_serialized_tensors = [
-            None for _ in range(self.device_mesh["tp"].size())
-        ] if self.device_mesh["tp"].get_local_rank() == 0 else None
-        dist.gather_object(
-            serialized_tensors,
-            gathered_serialized_tensors,
-            group_dst=0,
-            group=self.device_mesh["tp"].get_group(),
-        )
+            None for _ in range(self.tp_size)
+        ] if self.layout.tp_rank == 0 else None
+        if dist.is_initialized():
+            dist.gather_object(serialized_tensors, gathered_serialized_tensors,
+                               dst=self.layout.input_rank, group=self.replica_group)
+        else:
+            gathered_serialized_tensors = [serialized_tensors]
         # [
         #     [tp0_bucket0, tp0_bucket1, ...],
         #     [tp1_bucket0, tp1_bucket1, ...],
         #     ...
         # ]
-        if self.device_mesh["tp"].get_local_rank() == 0:
+        if self.layout.tp_rank == 0:
 
             for serialized_named_tensors in zip(*gathered_serialized_tensors):
                 # [
@@ -547,11 +472,7 @@ def sync_request(
     with requests.Session() as session:
         for trial in range(max_trials):
             try:
-                match method:
-                    case "POST":
-                        response = session.post(f"{url}/{endpoint}", **kwargs)
-                    case "GET":
-                        response = session.get(f"{url}/{endpoint}", **kwargs)
+                response = session.request(method, f"{url}/{endpoint}", **kwargs)
 
                 response.raise_for_status()
                 try:
@@ -559,7 +480,7 @@ def sync_request(
                 except json.decoder.JSONDecodeError:
                     return response.text
 
-            except:
+            except requests.RequestException:
                 if trial == max_trials - 1:
                     raise
                 time.sleep(retry_delay)

@@ -1,15 +1,17 @@
+from __future__ import annotations
+
 import torch
+import torch.distributed as dist
 import numpy as np
 from tensordict import TensorDict
-from ..config import RolloutConfig
-from rllava.engine import EngineFactory
 from rllava.data.protocol import DataProto
+from rllava.distribute.dist_utils import CoordinatorError, broadcast_object
 from rllava.utils.model_utils import print_gpu_memory_usage
-from typing import Callable
-from transformers import GenerationConfig
+from typing import Callable, TYPE_CHECKING
 from copy import deepcopy
 
-
+if TYPE_CHECKING:
+    from ..config import RolloutConfig
 
 __all__ = ["Rollout"]
 
@@ -29,6 +31,7 @@ class Rollout():
         self.tokenizer = tokenizer
         self.processor = processor
         self.reward = reward
+        self.rollout_engine = None
         if workflow is not None:
             self.workflow = workflow(
                 self.reward,
@@ -47,7 +50,12 @@ class Rollout():
         self.algorithm_config = None
         self.data_config = None
 
-    def initialize(self, model_path):
+    def initialize(self, model_path, dispatcher):
+        from rllava.engine import EngineFactory
+        from transformers import GenerationConfig
+
+        self.dispatcher = dispatcher
+        self.resources = dispatcher.resources
         self.model_path = model_path
         self.generation_config = GenerationConfig.from_pretrained(model_path)
 
@@ -59,8 +67,75 @@ class Rollout():
             config=self.config,
             tokenizer=self.tokenizer,
             processor=self.processor,
+            layout=dispatcher.resources.roles["rollout"],
         )
         print_gpu_memory_usage(f"After {self.config.name} rollout engine init")
+
+    def _broadcast(self, value):
+        return broadcast_object(value, src=self.resources.coordinator_rank, group=self.resources.control_group)
+
+    def run(self, collect_on_coordinator):
+        if self.resources.rank == self.resources.coordinator_rank:
+            try:
+                result = collect_on_coordinator()
+            except Exception as exc:
+                self._broadcast(("abort", f"{type(exc).__name__}: {exc}"))
+                raise
+            self._broadcast(("finish", None))
+            return result
+        while True:
+            command, error = self._broadcast(None)
+            if command == "finish":
+                return None
+            if command == "abort":
+                raise RuntimeError(error)
+            # A failed round returns all workers to this command loop; the
+            # coordinator broadcasts abort instead of stranding them in gather.
+            try:
+                self._generate_round(None)
+            except CoordinatorError:
+                continue
+
+    def generate(self, prompts):
+        self._broadcast(("generate", None))
+        result, error = self._generate_round(prompts)
+        if error:
+            raise RuntimeError(error)
+        return result
+
+    def _generate_round(self, prompts):
+        layout = self.resources.roles["rollout"]
+        local = self.dispatcher.scatter(prompts, "rollout")
+        if self.rollout_engine.collective_generate and self.resources.world_size > 1:
+            local = broadcast_object(local, src=layout.input_rank, group=layout.groups["replica"])
+        active = self.rollout_engine.collective_generate or (local is not None and len(local) > 0)
+        prepared, error = None, None
+        try:
+            if active:
+                prepared = self.rollout_engine.prepare(local)
+        except Exception as exc:
+            error = f"rank {self.resources.rank}: {type(exc).__name__}: {exc}"
+        error = self._agree_error(error)
+        if error:
+            return None, error
+
+        output, error = None, None
+        try:
+            if active:
+                output = self.rollout_engine.generate(prepared)
+        except Exception as exc:
+            error = f"rank {self.resources.rank}: {type(exc).__name__}: {exc}"
+        error = self._agree_error(error)
+        if error:
+            return None, error
+        return self.dispatcher.gather(output, "rollout"), None
+
+    def _agree_error(self, error):
+        errors = [error]
+        if self.resources.world_size > 1:
+            errors = [None] * self.resources.world_size
+            dist.all_gather_object(errors, error, group=self.resources.control_group)
+        return next((error for error in errors if error), None)
 
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Generate sequences using the rollout engine.
@@ -71,9 +146,6 @@ class Rollout():
         Returns:
             Generated sequences
         """
-        if self.rollout_engine is None:
-            raise RuntimeError("Rollout engine not initialized. Call init_model first.")
-        
         meta_info = {
             "eos_token_id": self.generation_config.eos_token_id
             if self.generation_config is not None
@@ -84,7 +156,7 @@ class Rollout():
         }
         prompts.meta_info.update(meta_info)
 
-        output = self.rollout_engine.generate(prompts=prompts)
+        output = self.generate(prompts)
         output = output.to("cpu")
         return output
 
@@ -131,7 +203,6 @@ class Rollout():
                 data = data.repeat(repeat_times=rollout_n, interleave=True)
             gen_batch_output = self.workflow.run(self, gen_batch, data)
         else:
-            # DP handled by Accelerate's sharded dataloaders; generate normally on each rank's batch
             gen_batch_output = self.generate_sequences(gen_batch)
 
         if self.rollout_processor is not None and val is False:
@@ -189,4 +260,3 @@ class Rollout():
                 self,
             )
         return new_batch
-

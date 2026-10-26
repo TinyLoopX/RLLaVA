@@ -33,8 +33,8 @@ class HFAccelerator(TrainEngine):
     Supports FSDP and DeepSpeed automatically through Accelerator configuration.
     """
     
-    def __init__(self, config):
-        self.config = config
+    def __init__(self, config, *, layout):
+        super().__init__(config, layout=layout)
 
         self.device_mesh = None
         if config.strategy == "fsdp":

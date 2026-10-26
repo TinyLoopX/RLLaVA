@@ -1,4 +1,3 @@
-import os
 import re
 import torch
 import numpy as np
@@ -89,24 +88,26 @@ class InferenceEngine():
     Engines are responsible for managing the rollout process for PPO training.
     """
     
+    collective_generate = False
+
     def __init__(
         self,
         model: torch.nn.Module,
         config: 'RolloutConfig',
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
+        layout,
     ):
         self.model = model
         # Keep tokenizer and processor references for engines needing decoding or multimodal preprocessing
         self.tokenizer = tokenizer
         self.processor = processor
-        self.rank = int(os.getenv("RANK", "0"))
-        self.world_size = int(os.getenv("WORLD_SIZE", "1"))
+        self.layout = layout
+        self.rank = layout.rank
+        self.world_size = layout.world_size
         self.config = config
         self.pad_token_id = tokenizer.pad_token_id
         self.use_tqdm = (self.rank == 0) and (not config.disable_tqdm)
-        if (torch.distributed.is_initialized() and config.tensor_parallel_size > torch.distributed.get_world_size()):
-            raise ValueError("Tensor parallelism size should be less than world size.")
 
         self.engine_kwargs = {}
         if processor is not None:  # only VLMs have processor
@@ -114,14 +115,12 @@ class InferenceEngine():
             if config.limit_images:
                 self.engine_kwargs["limit_mm_per_prompt"] = {"image": config.limit_images}
 
-        self.tp_size = self.config.tensor_parallel_size
-        self.dp_size = self.world_size // self.tp_size if self.tp_size > 0 else 1
-        if self.world_size % self.tp_size != 0:
-            raise ValueError(f"rollout world size {self.world_size} is not divisible by tp size {self.tp_size}.")
+        self.tp_size = layout.parallel.tp_size
+        self.dp_size = layout.dp_size
 
-        # Avoid creating distributed device mesh here since engine runs only on rank0.
-        # Creating a mesh would require collectives across all ranks and can deadlock.
-        self.device_mesh = None
+    def prepare(self, prompts: DataProto):
+        """Prepare local requests before entering backend collectives."""
+        return prompts
 
     def generate(self, prompts: DataProto) -> DataProto:
         raise NotImplementedError()
@@ -137,6 +136,9 @@ class InferenceEngine():
     def offload(self):
         """Offload the engine."""
         raise NotImplementedError()        
+
+    def close(self):
+        """Release backend-owned services after the final training phase."""
 
     def _rename_weight_keys(self, actor_weights: dict[str, Union[torch.Tensor, DTensor]], model: PreTrainedModel):
         # convert state dict keys: https://github.com/huggingface/transformers/pull/38385

@@ -4,7 +4,11 @@ import torch
 import numpy as np
 from torch.utils.data import DataLoader
 from typing import Any
-from rllava.utils.dist_utils import dist_rank0, is_rank0
+from collections import defaultdict
+from rllava.data.protocol import DataProto
+from rllava.ppo.utils.metrics import compute_length_metrics, reduce_metrics
+from rllava.utils.logger.aggregate_logger import print_rank_0
+from rllava.distribute.dist_utils import dist_rank0, is_rank0
 from rllava.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, remove_obsolete_ckpt, CHECKPOINT_TRACKER
 from rllava.utils.logger import Tracking, ValidationGenerationsLogger
 from rllava.utils.config import BaseConfig
@@ -25,7 +29,7 @@ class Pipeline:
         self.global_steps = 0
         # dataloader epoch counter for DistributedSampler.set_epoch
         self._dataloader_epoch = 0
-                
+
         self.val_reward_score = 0.0
         self.best_val_reward_score = -1.0
         self.best_global_step = None
@@ -37,7 +41,7 @@ class Pipeline:
         self.validation_generations_logger = ValidationGenerationsLogger()
 
         self.train_dataloader, self.val_dataloader = train_dataloader, val_dataloader
-        
+
         self.logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -64,7 +68,7 @@ class Pipeline:
 
         folder_path = os.path.join(self.config.trainer.save_checkpoint_path, f"global_step_{self.global_steps}")
         self.model.save_checkpoint(folder_path)
-        
+
         if is_rank0():
             remove_obsolete_ckpt(
                 self.config.trainer.save_checkpoint_path,
@@ -72,11 +76,11 @@ class Pipeline:
                 self.best_global_step,
                 self.config.trainer.save_limit,
             )
-    
+
             dataloader_path = os.path.join(folder_path, "dataloader.pt")
             dataloader_state_dict = self.train_dataloader.state_dict()
             torch.save(dataloader_state_dict, dataloader_path)
-    
+
             checkpointer_tracker_info = {
                 "best_global_step": self.best_global_step,
                 "best_val_reward_score": round(self.best_val_reward_score, 4),
@@ -86,7 +90,7 @@ class Pipeline:
             checkpointer_tracker_path = os.path.join(self.config.trainer.save_checkpoint_path, CHECKPOINT_TRACKER)
             with open(checkpointer_tracker_path, "w") as f:
                 json.dump(checkpointer_tracker_info, f, ensure_ascii=False, indent=2)
-        
+
     def load_checkpoint(self) -> None:
         if self.config.trainer.load_checkpoint_path is not None:
             load_checkpoint_path = self.config.trainer.load_checkpoint_path
@@ -111,7 +115,7 @@ class Pipeline:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
-        
+
     @dist_rank0()
     def maybe_log_val_generations(
         self, inputs: list[str], outputs: list[str], labels: list[str], scores: list[float]
@@ -132,9 +136,52 @@ class Pipeline:
         samples = samples[: self.config.trainer.val_generations_to_log]
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
-    @dist_rank0()
-    def validate(self) -> dict[str, Any]:
-        raise NotImplementedError()
+    def validate(self, metrics: dict[str, Any] | None = None) -> dict[str, Any]:
+        metrics = {} if metrics is None else metrics
+        reward_tensor_lst = []
+        # Lists to collect samples for the table
+        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
+        reward_metrics_lst = defaultdict(list)
+        length_metrics_lst = defaultdict(list)
+        print_rank_0("Start validation...")
+        def collect():
+            for batch_dict in self.val_dataloader:
+                test_batch = DataProto.from_single_dict(batch_dict)
+                test_batch = self.model.rollout.generate_one_batch(test_batch, val=True)
+                # evaluate using reward_function
+                reward_tensor, reward_metrics = self.model.compute_rewards(test_batch)
+
+                # store generations
+                input_ids = test_batch.batch["prompts"]
+                input_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                output_ids = test_batch.batch["responses"]
+                output_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+                scores = reward_tensor.sum(-1).cpu().tolist()
+                sample_inputs.extend(input_texts)
+                sample_outputs.extend(output_texts)
+                sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
+                sample_scores.extend(scores)
+
+                reward_tensor_lst.append(reward_tensor)
+                for key, value in reward_metrics.items():
+                    reward_metrics_lst[key].extend(value)
+
+                for key, value in compute_length_metrics(test_batch).items():
+                    length_metrics_lst[key].append(value)
+
+
+        with self.model.generate_context():
+            self.model.rollout.run(collect)
+
+        if is_rank0() and reward_tensor_lst:
+            self.maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
+
+            self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
+            val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
+            val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
+
+            metrics.update({"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics})
+        return metrics
 
     def run(self):
         raise NotImplementedError()

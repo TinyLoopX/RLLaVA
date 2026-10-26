@@ -1,14 +1,10 @@
-import torch
-from collections import defaultdict
-from typing import Any
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from rllava.utils.logger.aggregate_logger import print_rank_0
-from rllava.ppo.utils.metrics import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics, compute_length_metrics
+from rllava.ppo.utils.metrics import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
 from rllava.utils.py_functional import timer
 from rllava.train.pipeline.base import Pipeline
 from rllava.utils.config import BaseConfig, init_config
-from rllava.utils.dist_utils import init_dist, is_rank0, dist_batch, gather_batch
+from rllava.distribute.dist_utils import init_dist, is_rank0
 from rllava.ppo import PPOConfig, PPO, Rollout
 from rllava.ppo.plugins import get_adv_estimator, get_policy_loss, PrefixRolloutProcessor, HPTBatchRolloutProcessor
 from rllava.ppo.role.reward import Reward
@@ -25,57 +21,6 @@ class RLVRPipeline(Pipeline):
         super().__init__(model, config, train_dataloader, val_dataloader)
         self.config: PPOConfig = self.config  # Explicitly specify the type of self.config
         self.model: PPO = self.model
-
-    def validate(self, metrics: dict[str, Any]=dict()) -> dict[str, Any]:
-        reward_tensor_lst = []
-        # Lists to collect samples for the table
-        sample_inputs, sample_outputs, sample_labels, sample_scores = [], [], [], []
-        reward_metrics_lst = defaultdict(list)
-        length_metrics_lst = defaultdict(list)
-        print_rank_0("Start validation...")
-        with self.model.generate_context():
-            iterator = iter(self.val_dataloader)
-            while True:
-                test_batch = dist_batch(iterator)
-                if test_batch is None:
-                    break
-
-                test_batch = self.model.rollout.generate_one_batch(test_batch, val=True)
-                test_batch = gather_batch(test_batch)
-
-                if is_rank0():
-                    # evaluate using reward_function
-                    reward_tensor, reward_metrics = self.model.compute_rewards(test_batch)
-
-                    # store generations
-                    input_ids = test_batch.batch["prompts"]
-                    input_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-                    output_ids = test_batch.batch["responses"]
-                    output_texts = [self.model.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-                    scores = reward_tensor.sum(-1).cpu().tolist()
-                    sample_inputs.extend(input_texts)
-                    sample_outputs.extend(output_texts)
-                    sample_labels.extend(test_batch.non_tensor_batch["ground_truth"].tolist())
-                    sample_scores.extend(scores)
-
-                    reward_tensor_lst.append(reward_tensor)
-                    for key, value in reward_metrics.items():
-                        reward_metrics_lst[key].extend(value)
-
-                    for key, value in compute_length_metrics(test_batch).items():
-                        length_metrics_lst[key].append(value)
-
-                # break
-
-        if is_rank0():
-            self.maybe_log_val_generations(sample_inputs, sample_outputs, sample_labels, sample_scores)
-    
-            self.val_reward_score = torch.cat(reward_tensor_lst, dim=0).sum(-1).mean().item()
-            val_reward_metrics = {f"val/{key}_reward": value for key, value in reduce_metrics(reward_metrics_lst).items()}
-            val_length_metrics = {f"val_{key}": value for key, value in reduce_metrics(length_metrics_lst).items()}
-            
-            metrics.update({"val/reward_score": self.val_reward_score, **val_reward_metrics, **val_length_metrics})
-            return metrics
 
     def run(self):
 
@@ -109,8 +54,8 @@ class RLVRPipeline(Pipeline):
                 with timer("update", timing_raw):
                     output = self.model.update_model(batch, global_steps=self.global_steps)
                     
-                batch = gather_batch(batch)
-                output = gather_batch(output)
+                batch = self.model.dispatcher.gather(batch)
+                output = self.model.dispatcher.gather(output)
 
                 self.global_steps += 1
 
@@ -132,7 +77,7 @@ class RLVRPipeline(Pipeline):
                 metrics.update(batch.meta_info.get("adv_metrics", {}))
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.model.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
-                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=1))
+                metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, num_gpus=self.model.resources.world_size))
                 metrics.update(reduce_metrics(output.non_tensor_batch))
 
                 self.logger.log(data=metrics, step=self.global_steps)
@@ -182,11 +127,14 @@ def main():
     )
 
     # Initialize and run the RL training pipeline with the configured model and dataloaders
-    pipeline = RLVRPipeline(config=config,
-                            train_dataloader=train_dataloader,
-                            val_dataloader=val_dataloader,
-                            model=model)
-    pipeline.run()
+    try:
+        pipeline = RLVRPipeline(config=config,
+                                train_dataloader=train_dataloader,
+                                val_dataloader=val_dataloader,
+                                model=model)
+        pipeline.run()
+    finally:
+        model.close()
 
 
 

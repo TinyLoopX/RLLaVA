@@ -1,6 +1,6 @@
 import inspect
 import logging
-import time
+import secrets
 import torch
 from typing import Optional, List, Dict, Union, TYPE_CHECKING
 from packaging.version import InvalidVersion, Version
@@ -21,6 +21,7 @@ from rllava.utils import torch_functional as VF
 from rllava.utils.model_utils import print_gpu_memory_usage
 from rllava.utils.transformers_compat import is_transformers_version_in_range
 from rllava.utils.device import get_device_id
+from rllava.distribute.dist_utils import broadcast_object
  
  
 if TYPE_CHECKING:
@@ -77,14 +78,17 @@ def apply_vllm_model_patches(model_name_or_path: str) -> None:
 
 @register_engine("vllm")
 class VLLMEngine(InferenceEngine):
+    collective_generate = True
+
     def __init__(
         self,
         model_name_or_path: str,
         config: 'RolloutConfig',
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin],
+        layout,
     ):
-        super().__init__(model_name_or_path, config, tokenizer, processor)
+        super().__init__(model_name_or_path, config, tokenizer, processor, layout)
 
         if config.vllm.max_num_batched_tokens < config.prompt_length + config.response_length:
             raise ValueError("max_num_batched_tokens should be greater than prompt_length + response_length.")
@@ -101,6 +105,8 @@ class VLLMEngine(InferenceEngine):
         if version is None or version < Version("0.11.0"):
             raise ValueError("Rollout log probabilities require vLLM >= 0.11.0 with processed_logprobs support.")
         self.engine_kwargs["logprobs_mode"] = "processed_logprobs"
+        seed = config.seed if config.seed is not None else secrets.randbelow(2**31)
+        seed = broadcast_object(seed, group=layout.groups.get("control"))
         
         self.inference_engine = LLM(
             model=model_name_or_path,
@@ -108,10 +114,11 @@ class VLLMEngine(InferenceEngine):
             trust_remote_code=config.trust_remote_code,
             load_format=config.load_format,
             dtype=config.vllm.dtype,
-            seed=config.seed,
+            seed=seed,
             max_model_len=config.vllm.max_model_len or config.prompt_length + config.response_length,
             distributed_executor_backend="external_launcher",
-            tensor_parallel_size=config.tensor_parallel_size,
+            tensor_parallel_size=self.tp_size,
+            data_parallel_size=self.dp_size,
             gpu_memory_utilization=config.vllm.gpu_memory_utilization,
             max_num_batched_tokens=config.vllm.max_num_batched_tokens,
             disable_log_stats=config.vllm.disable_log_stats,
@@ -141,6 +148,7 @@ class VLLMEngine(InferenceEngine):
         print(f"Sampling params: {sampling_kwargs}.")
         self.sampling_params = SamplingParams(**sampling_kwargs)
         self.loaded = False
+        self.weight_version = 0
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -159,21 +167,10 @@ class VLLMEngine(InferenceEngine):
             for key, value in old_sampling_params_args.items():
                 setattr(self.sampling_params, key, value)
 
-    def generate(self, prompts: DataProto) -> DataProto:
-        temperature = prompts.meta_info.get("temperature", self.config.temperature)
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["kv_cache"]) 
-
-        # left-padded attention_mask
-        input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)
-        attention_mask: torch.Tensor = prompts.batch["attention_mask"]
-        position_ids: torch.Tensor = prompts.batch["position_ids"]
-        eos_token_id: int = prompts.meta_info["eos_token_id"]
-        batch_size = input_ids.size(0)
-
+    def prepare(self, prompts: DataProto):
         non_tensor_batch = prompts.non_tensor_batch
-        batch_raw_prompt_ids = non_tensor_batch.pop("raw_prompt_ids")
-        batch_multi_modal_data = non_tensor_batch.pop("multi_modal_data", None)
+        batch_raw_prompt_ids = non_tensor_batch["raw_prompt_ids"]
+        batch_multi_modal_data = non_tensor_batch.get("multi_modal_data")
         
         if batch_multi_modal_data is not None:
             engine_inputs = []
@@ -193,6 +190,23 @@ class VLLMEngine(InferenceEngine):
         else:
             engine_inputs = [{"prompt_token_ids": list(raw_prompt_ids)} for raw_prompt_ids in batch_raw_prompt_ids]
         
+        return prompts, engine_inputs
+
+    def generate(self, prepared) -> DataProto:
+        prompts, engine_inputs = prepared
+        temperature = prompts.meta_info.get("temperature", self.config.temperature)
+        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+            self.inference_engine.wake_up(tags=["kv_cache"])
+
+        # left-padded attention_mask
+        input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)
+        attention_mask: torch.Tensor = prompts.batch["attention_mask"]
+        position_ids: torch.Tensor = prompts.batch["position_ids"]
+        eos_token_id: int = prompts.meta_info["eos_token_id"]
+        batch_size = input_ids.size(0)
+
+        batch_multi_modal_data = prompts.non_tensor_batch.get("multi_modal_data")
+
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -207,6 +221,9 @@ class VLLMEngine(InferenceEngine):
             completions: List[RequestOutput] = self.inference_engine.generate(
                 prompts=engine_inputs, sampling_params=self.sampling_params, use_tqdm=self.use_tqdm, lora_request=lora_requests,
             )
+            # External-launcher DP ranks with no requests still join scheduler collectives.
+            if batch_size == 0:
+                return None
             outputs = [output for completion in completions for output in completion.outputs]
             token_ids = [list(output.token_ids) for output in outputs]
             token_log_probs = [
@@ -263,7 +280,8 @@ class VLLMEngine(InferenceEngine):
         if self.lora_kwargs:
             weights = get_peft_model_state_dict(model)
             peft_config = model.peft_config.get("default", None)
-            lora_int_id = int(time.time_ns() % 0x7FFFFFFF)
+            self.weight_version += 1
+            lora_int_id = self.weight_version
             lora_request = TensorLoRARequest(
                 lora_name=f"{lora_int_id}",
                 lora_int_id=lora_int_id,

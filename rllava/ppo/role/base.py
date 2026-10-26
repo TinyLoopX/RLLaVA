@@ -17,8 +17,9 @@ except ImportError:
 
 
 class Role:
-    def __init__(self, config, tokenizer=None, processor=None):
+    def __init__(self, config, tokenizer=None, processor=None, *, layout):
         self.config = config
+        self.layout = layout
         self.tokenizer = tokenizer
         self.processor = processor
         self.model = None
@@ -26,7 +27,7 @@ class Role:
         self.lr_scheduler = None
         self.device_name = get_device_name()
 
-        self.accelerator = EngineFactory(config.strategy)(config)
+        self.accelerator = EngineFactory(config.strategy)(config, layout=layout)
 
     def prepare_multi_modal_inputs(self, micro_batch: Dict[str, torch.Tensor]) -> Dict[str, Optional[torch.Tensor]]:
         if "multi_modal_inputs" not in micro_batch:
@@ -64,8 +65,8 @@ class Role:
 
 
 class PolicyRole(Role):
-    def __init__(self, config, tokenizer=None, processor=None):
-        super().__init__(config, tokenizer, processor)
+    def __init__(self, config, tokenizer=None, processor=None, *, layout):
+        super().__init__(config, tokenizer, processor, layout=layout)
 
         if config.use_torch_compile:
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)

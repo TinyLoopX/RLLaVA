@@ -12,14 +12,16 @@ from dataclasses import is_dataclass, fields, asdict
 T = TypeVar("T")
 
 def init_config(cls: Type[T]) -> T:
+    from rllava.distribute.resource_manager import normalize_parallel_config
+
     cli_args = OmegaConf.from_cli()
     default_config = OmegaConf.structured(cls())
     if "config" in cli_args:
         config_path = cli_args["config"]
         del cli_args["config"]
-        file_config = OmegaConf.load(config_path)
+        file_config = normalize_parallel_config(OmegaConf.load(config_path))
         default_config = OmegaConf.merge(default_config, file_config)
-    config = OmegaConf.merge(default_config, cli_args)
+    config = OmegaConf.merge(default_config, normalize_parallel_config(cli_args))
     obj = OmegaConf.to_object(config)
     if not isinstance(obj, cls):
         obj = cls(**obj)  # type: ignore[arg-type]

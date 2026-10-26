@@ -36,8 +36,8 @@ logger.setLevel(os.getenv("RLLAVA_LOGGING_LEVEL", "WARN"))
 class DeepSpeedAccelerator(TrainEngine):
     """Native DeepSpeed engine mirroring the TrainEngine contract."""
 
-    def __init__(self, config):
-        super().__init__(config)
+    def __init__(self, config, *, layout):
+        super().__init__(config, layout=layout)
         if not is_deepspeed_available():
             raise ImportError(
                 "DeepSpeed is not installed. Please install it before selecting the 'deepspeed' strategy."
@@ -135,7 +135,7 @@ class DeepSpeedAccelerator(TrainEngine):
         gradient_accumulation_steps = max(1, per_device_mini_batch // micro_batch_size)
         
         train_batch_size = (
-            micro_batch_size * gradient_accumulation_steps * max(1, self.world_size)
+            micro_batch_size * gradient_accumulation_steps * self.layout.dp_size
         )
 
         dtype = (self.ds_config.torch_dtype or "").lower()
