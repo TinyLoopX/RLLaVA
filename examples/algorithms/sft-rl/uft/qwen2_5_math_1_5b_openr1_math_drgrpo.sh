@@ -18,7 +18,7 @@ HINT_STEPS=100  # number of steps for cosine annealing, 0 means no annealing (fi
 
 NAME=qwen2_5_math_1_5b_uft_drgrpo
 
-torchrun --nproc_per_node=2 --master-port 29509 -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=2 --master-port 29509 -m rllava.controller \
     config=examples/config.yaml \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=false \

@@ -11,7 +11,7 @@ CONFIG_FILE="$CONFIG_DIR/config_chord.yaml"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3}
 NP=${NP:-4}
 
-torchrun --nproc_per_node=$NP -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=$NP -m rllava.controller \
   --config "$CONFIG_FILE" \
   trainer.n_gpus_per_node=$NP \
   actor.model.model_path=${OBS_CHORD_MODEL:-Qwen/Qwen2.5-1.5B-Instruct} \

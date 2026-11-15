@@ -10,7 +10,7 @@ from rllava.data.data_utils import process_image, process_video
 
 if TYPE_CHECKING:
     # Import for type checking only to avoid runtime circular import
-    from rllava.ppo.config import RolloutConfig
+    from rllava.rollout.config import RolloutConfig
 
 
 def response_mask_from_lengths(response_ids, lengths, eos_token_id, *, dtype, ignore_eos=False):

@@ -25,7 +25,7 @@ from rllava.distribute.dist_utils import broadcast_object
  
  
 if TYPE_CHECKING:
-    from rllava.ppo.config import RolloutConfig
+    from rllava.rollout.config import RolloutConfig
 
 logger = logging.getLogger(__name__)
 

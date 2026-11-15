@@ -10,7 +10,7 @@ TRAIN_SET=your_org/dataset@train
 OUTPUT_DIR=your_output_directory
 export TENSORBOARD_DIR=$OUTPUT_DIR
 
-CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 -m rllava.train.pipeline.rlvr \
+CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 -m rllava.controller \
   config=examples/config.yaml \
   data.train_files=${TRAIN_SET} \
   data.format_prompt=./examples/format_prompt/your_task.jinja \

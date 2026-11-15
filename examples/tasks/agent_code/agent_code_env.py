@@ -36,7 +36,7 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 from PIL import Image
 
-from rllava.ppo.env.base import BaseEnv
+from rllava.rollout.envs.base import BaseEnv
 
 logger = logging.getLogger(__name__)
 

@@ -1,24 +1,18 @@
-import copy
 import json
 import os
 import shutil
 import hashlib
-import transformers
 import traceback
 import torch
 import torch.distributed as dist
 import rllava.utils.torch_functional as VF
 from typing import Optional, List, Any
-from dataclasses import dataclass
 from jinja2 import Template
-from typing import Dict,  Sequence
-from PIL import Image, ImageFile
+from typing import Dict
+from PIL import ImageFile
 from datasets import load_dataset, load_from_disk, concatenate_datasets
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
-from .text_preprocess import TextPreprocess
-from .image_preprocess import ImagePreprocess
-from rllava.utils.arguments import DataArguments
 from rllava.data.data_utils import process_image, process_video
 from rllava.utils.constants import *
 from rllava.distribute import dist_utils
@@ -403,135 +397,3 @@ class RLHFDataset(Dataset):
             example["ground_truth"] = ""
         example["item"] = index
         return example
-
-
-class SFTDataset(RLHFDataset):
-    """RLHF dataset with explicit supervised targets for SFT training."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        if "cot_key" in kwargs:
-            self.cot_key = kwargs["cot_key"]
-
-    def __getitem__(self, index):
-        example = super().__getitem__(index)
-        eos_id = self.tokenizer.eos_token_id
-        target_text = str(example["ground_truth"])
-        if hasattr(self, "cot_key") and self.cot_key in example and example[self.cot_key] is not None:
-            cot_text = str(example[self.cot_key]).strip()
-            if cot_text:
-                target_text = f"{cot_text}\n{target_text}"
-        target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
-        if eos_id is not None:
-            target_ids = target_ids + [eos_id]
-        # Keep raw targets in dataset; truncation/padding policy is owned by pipeline.
-        example["tgt_input_ids"] = target_ids
-        return example
-
-
-class LazySupervisedDataset(Dataset):
-    """Dataset for supervised fine-tuning."""
-
-    def __init__(self, data_path: str,
-                 tokenizer: transformers.PreTrainedTokenizer,
-                 data_args: DataArguments):
-        super(LazySupervisedDataset, self).__init__()
-        list_data_dict = json.load(open(data_path, "r"))
-
-        self.tokenizer = tokenizer
-        self.list_data_dict = list_data_dict
-        self.data_args = data_args
-        self.text_preprocess = TextPreprocess(tokenizer, data_args.conv_version)
-        self.image_preprocess = ImagePreprocess(data_args.image_processor, data_args)
-
-    def __len__(self):
-        return len(self.list_data_dict)
-
-    @property
-    def lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            img_tokens = 128 if 'image' in sample else 0
-            length_list.append(sum(len(conv['value'].split()) for conv in sample['conversations']) + img_tokens)
-        return length_list
-
-    @property
-    def modality_lengths(self):
-        length_list = []
-        for sample in self.list_data_dict:
-            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
-            cur_len = cur_len if 'image' in sample else -cur_len
-            length_list.append(cur_len)
-        return length_list
-
-    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-        sources = self.list_data_dict[i]
-        data_dict = self.text_preprocess(copy.deepcopy(sources["conversations"]))
-        if 'image' in sources:
-            image_file = self.list_data_dict[i]['image']
-            image_folder = self.data_args.image_folder
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-            image = self.image_preprocess(image)
-            data_dict['image'] = image
-        elif self.data_args.is_multimodal:
-            # image does not exist in the data, but the model is multimodal
-            # print(f'{i}:{sources}')
-            crop_size = getattr(self.data_args.image_processor, 'crop_size', getattr(self.data_args.image_processor, 'size'))
-            data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
-        return data_dict
-
-
-@dataclass
-class DataCollatorForSupervisedDataset(object):
-    """Collate examples for supervised fine-tuning."""
-
-    tokenizer: transformers.PreTrainedTokenizer
-
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
-        input_ids, labels = tuple([instance[key] for instance in instances]
-                                  for key in ("input_ids", "labels"))
-        if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
-            for input_id in input_ids:
-                input_id[input_id == self.tokenizer.eos_token_id] = -300
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id)
-        labels = torch.nn.utils.rnn.pad_sequence(labels,
-                                                 batch_first=True,
-                                                 padding_value=IGNORE_INDEX)
-        input_ids = input_ids[:, :self.tokenizer.model_max_length]
-        attention_mask = input_ids.ne(self.tokenizer.pad_token_id)
-        labels = labels[:, :self.tokenizer.model_max_length]
-        # FIXME: This is a hack for handling phi and stablelm, as they have the same eos, pad and unk. We want the model
-        # FIXME: to predict the eos in the input ids, but we also use the id of eos to pad sequence, so we use a temp
-        # FIXME: eos id first, and convert them back.
-        if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
-            for input_id in input_ids:
-                input_id[input_id == -300] = self.tokenizer.eos_token_id
-
-        batch = dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
-        )
-
-        if 'image' in instances[0]:
-            images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
-            else:
-                batch['images'] = images
-
-        return batch
-
-
-def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
-                                data_args) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                          data_path=data_args.data_path,
-                                          data_args=data_args)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset,
-                eval_dataset=None,
-                data_collator=data_collator)

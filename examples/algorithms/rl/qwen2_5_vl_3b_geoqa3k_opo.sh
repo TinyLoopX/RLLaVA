@@ -18,7 +18,7 @@ NAME=qwen2_5_vl_3b_geoqa3k_opo
 # To ensure exact on-policy: set ppo_mini_batch_size equal to train_batch_size, and ppo_epochs=1 (default is 1)
 # Also disable KL and entropy regularization, and use grouped sampling with n>=2
 
-torchrun --nproc_per_node=2 -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=2 -m rllava.controller \
     config=examples/config.yaml \
     algorithm.adv_estimator=opo \
     algorithm.use_kl_loss=false \

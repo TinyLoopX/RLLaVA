@@ -26,7 +26,7 @@ import re
 import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from rllava.ppo.env.base import BaseEnv
+from rllava.rollout.envs.base import BaseEnv
 from rllava.eval.agent_search.tools.web_search import web_search_BOCHA_API, web_search_SERPER_API
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ def _resolve_search_fn(backend: str) -> Callable[..., List[Dict[str, str]]]:
     loop and the offline benchmark share **the same** retrieval function.
     """
     # Make sure we can import the eval package even when launched via
-    # ``-m rllava.train.pipeline.agentic`` from arbitrary cwds.
+    # ``-m rllava.controller`` from arbitrary cwds.
     here = os.path.dirname(os.path.abspath(__file__))
     repo_root = os.path.abspath(os.path.join(here, "..", "..", ".."))
     if repo_root not in sys.path:

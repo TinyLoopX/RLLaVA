@@ -14,7 +14,7 @@ VAL_SET="${LOCAL_DATASET_PATH}@test"
 OUTPUT_DIR="/mnt/ve_share/zhaolei/outputs"
 export TENSORBOARD_DIR=$OUTPUT_DIR
 
-torchrun --nproc_per_node=2 -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=2 -m rllava.controller \
     config=examples/config.yaml \
     data.train_files=${TRAIN_SET} \
     data.val_files=${VAL_SET} \

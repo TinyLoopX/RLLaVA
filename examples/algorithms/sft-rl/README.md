@@ -27,16 +27,18 @@ examples/algorithms/sft-rl/
 
 ## Implementation Highlights
 
-To understand how these methods map to the codebase, refer to `rllava/ppo/`:
+The implementation is organized by sampling and learning responsibilities:
 
-1.  **Experience Mixing (`experience_mixer.py`)**: 
-    *   **`ExperienceMixer`**: Handles **HPT** logic: Reorganizing the batch *after* rollout collection but *before* the optimization step (e.g., swapping data).
+1.  **Trajectory Processing (`rllava/rollout/processors.py`)**:
+    *   **`HPTBatchRolloutProcessor`**: Handles HPT batch rewriting after rollout.
+    *   **`PrefixRolloutProcessor`**: Handles hint injection and prefix masking.
 
-2.  **Trajectory Processing (`rollout_process.py`)**:
-    *   **`RolloutProcessor`**: Handles **UFT**'s hint injection (pre-process) and **LUFFY/UFT**'s prefix masking (post-process).
-
-3.  **Policy Loss (`policy_loss.py`)**:
+2.  **Policy Loss (`rllava/train/policy_loss.py`)**:
     *   Custom loss functions (plugins) that handle the specific gradient math for each method (e.g., `compute_policy_loss_srft`, `compute_policy_loss_luffy`).
+
+3.  **Configuration**: `rllava/controller/config.py` composes role, rollout, and learning configurations. All RL examples use `rllava.controller` as their entry point.
+
+Prefix/unify strategies remain disabled by configuration validation until response rewriting and rollout log probabilities are aligned.
 
 ## Usage
 

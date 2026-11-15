@@ -20,7 +20,7 @@ from rllava.utils.device import get_device_id
 
 
 if TYPE_CHECKING:
-    from rllava.ppo.config import RolloutConfig
+    from rllava.rollout.config import RolloutConfig
 
 
 logger = logging.getLogger(__file__)

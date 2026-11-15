@@ -1,5 +1,5 @@
 tools:
-  - class_name: "rllava.ppo.tool.web_search_tool.WebSearchTool"
+  - class_name: "rllava.rollout.tools.web_search_tool.WebSearchTool"
     config:
       backend: bocha          # bocha / serper / ddg
       search_num: 4

@@ -43,7 +43,8 @@ export TENSORBOARD_DIR=$OUTPUT_DIR
 NAME=deepeyes_visual_grpo_qwen3_vl_4b
 
 # ---------- Train ----------
-CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29618 --nproc_per_node=1 -m rllava.train.pipeline.agentic \
+CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29618 --nproc_per_node=1 -m rllava.controller \
+    rollout.agent=multi_turn \
     config=examples/config.yaml \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_loss=false \

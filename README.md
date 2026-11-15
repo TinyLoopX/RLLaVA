@@ -77,7 +77,7 @@ RLLaVA makes it easy to define custom tasks. You only need 3 files:
 3. **Launch script / command** → Point to dataset + reward + prompt (no need to modify YAML directly):
 
 ```bash
-torchrun -m rllava.train.pipeline.rlvr \
+torchrun -m rllava.controller \
   config=examples/config.yaml \
   data.train_files=your_org/dataset@train \
   data.format_prompt=./examples/format_prompt/your_task.jinja \
@@ -92,7 +92,7 @@ For detailed usage instructions, please refer to `examples/README.md`
 Use torchrun to select the GPU count. Training uses the selected FSDP/FSDP2/ZeRO backend; generation defaults to one replica per GPU. For vLLM or SGLang, set the number of GPUs per generation replica:
 
 ```bash
-torchrun --nproc_per_node=4 -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=4 -m rllava.controller \
   config=examples/config.yaml rollout.gpus_per_replica=2
 ```
 

@@ -14,7 +14,7 @@ export TENSORBOARD_DIR=$OUTPUT_DIR
 
 NAME=qwen3_vl_2b_srft_drgrpo_geoqa
 
-torchrun --nproc_per_node=2 --master-port 29503 -m rllava.train.pipeline.sft_rl \
+torchrun --nproc_per_node=2 --master-port 29503 -m rllava.controller \
     config=examples/config.yaml \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=false \

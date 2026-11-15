@@ -7,19 +7,20 @@ export PYTHONUNBUFFERED=1
 
 MODEL_PATH="Tongyi-MAI/MAI-UI-8B"
 LOCAL_DATASET_PATH="./examples/data/osworld_train.json"
-ENV_CONFIG="./rllava/ppo/env/osworld_subprocess.yaml"
+ENV_CONFIG="./rllava/rollout/envs/osworld_subprocess.yaml"
 OUTPUT_DIR="outputs/rllava/gui_agent_osworld"
 EXP_NAME="mai_ui_2b_osworld_grpo"
 
 export TENSORBOARD_DIR="${OUTPUT_DIR}"
 
-CUDA_VISIBLE_DEVICES=5 torchrun --master_port=29619 --nproc_per_node=1 -m rllava.train.pipeline.rlvr \
+CUDA_VISIBLE_DEVICES=5 torchrun --master_port=29619 --nproc_per_node=1 -m rllava.controller \
     config=examples/config_gui.yaml \
     actor.model.model_path="${MODEL_PATH}" \
     data.train_files=${LOCAL_DATASET_PATH} \
     data.val_files=${LOCAL_DATASET_PATH} \
     rollout.env_config_path="${ENV_CONFIG}" \
     rollout.max_turns=15 \
+    rollout.agent=gui \
     reward.reward_type=env \
     trainer.experiment_name="${EXP_NAME}" \
     trainer.outputs_dir="${OUTPUT_DIR}" \

@@ -15,7 +15,7 @@ VAL_SET="${LOCAL_DATASET_PATH}@train"
 OUTPUT_DIR="outputs"
 export TENSORBOARD_DIR=$OUTPUT_DIR
 
-CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 -m rllava.train.pipeline.rlvr \
+CUDA_VISIBLE_DEVICES=4 torchrun --nproc_per_node=1 -m rllava.controller \
     config=examples/config.yaml \
     data.train_files=${TRAIN_SET} \
     data.val_files=${VAL_SET} \

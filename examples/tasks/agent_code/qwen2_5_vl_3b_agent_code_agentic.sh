@@ -2,7 +2,7 @@
 # Multi-turn agentic RL training for MAT-Coding (OpenCV-tool agent).
 #
 # Architecture mirrors examples/tasks/deepeyes/deepeyes_visual_grpo.sh:
-#   * pipeline = rllava.train.pipeline.agentic   (uses MultiTurnWorkflow)
+#   * controller = rllava.controller   (rollout.agent=multi_turn)
 #   * env      = examples/tasks/agent_code/agent_code_env.py:AgentCodeEnv
 #                wraps the OpenCV code-execution loop from
 #                rllava/eval/agent_code/eval_mat_coding.py
@@ -36,7 +36,8 @@ export TENSORBOARD_DIR=$OUTPUT_DIR
 NAME=qwen2_5_vl_7b_agent_code_agentic
 
 # ---------- Train ----------
-CUDA_VISIBLE_DEVICES=4 torchrun --master_port=29617 --nproc_per_node=1 -m rllava.train.pipeline.agentic \
+CUDA_VISIBLE_DEVICES=4 torchrun --master_port=29617 --nproc_per_node=1 -m rllava.controller \
+    rollout.agent=multi_turn \
     config=examples/config.yaml \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_loss=false \

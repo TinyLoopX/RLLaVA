@@ -97,7 +97,7 @@ class _AsyncGenerateAdapter:
 
 
 if TYPE_CHECKING:
-    from rllava.ppo.config import RolloutConfig
+    from rllava.rollout.config import RolloutConfig
 
 
 @register_engine("sglang")

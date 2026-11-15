@@ -2,7 +2,7 @@
 # Multi-turn agentic RL training for MAT-Search (Web-search agent).
 #
 # Architecture mirrors examples/tasks/deepeyes/deepeyes_visual_grpo.sh:
-#   * pipeline = rllava.train.pipeline.agentic   (uses MultiTurnWorkflow)
+#   * controller = rllava.controller   (rollout.agent=multi_turn)
 #   * env      = examples/tasks/agent_search/agent_search_env.py:AgentSearchEnv
 #                wraps the BOCHA web_search call from
 #                rllava/eval/agent_search/eval_mat_search.py
@@ -35,7 +35,8 @@ export TENSORBOARD_DIR=$OUTPUT_DIR
 NAME=qwen2_5_vl_3b_agent_search_agentic
 
 # ---------- Train ----------
-CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29501 --nproc_per_node=1 -m rllava.train.pipeline.agentic \
+CUDA_VISIBLE_DEVICES=3 torchrun --master_port=29501 --nproc_per_node=1 -m rllava.controller \
+    rollout.agent=multi_turn \
     config=examples/config.yaml \
     algorithm.adv_estimator=grpo \
     algorithm.use_kl_loss=false \

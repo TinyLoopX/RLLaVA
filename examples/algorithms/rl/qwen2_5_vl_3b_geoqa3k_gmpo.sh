@@ -15,7 +15,7 @@ export TENSORBOARD_DIR=$OUTPUT_DIR
 
 NAME=qwen2_5_vl_3b_geoqa3k_gmpo
 
-torchrun --nproc_per_node=2 -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=2 -m rllava.controller \
     config=examples/config.yaml \
     algorithm.use_kl_loss=false \
     data.train_files=${TRAIN_SET} \

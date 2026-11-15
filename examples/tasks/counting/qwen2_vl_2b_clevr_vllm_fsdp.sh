@@ -14,7 +14,7 @@ OUTPUT_DIR="outputs"
 export TENSORBOARD_DIR=$OUTPUT_DIR
 
 
-torchrun --nproc_per_node=2 -m rllava.train.pipeline.rlvr \
+torchrun --nproc_per_node=2 -m rllava.controller \
     config=examples/config.yaml \
     data.train_files=${TRAIN_SET} \
     data.val_files=${VAL_SET} \
